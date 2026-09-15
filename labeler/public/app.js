@@ -411,6 +411,34 @@ function labelType(id) {
   return labelTypes().find((label) => label.id === id) || null;
 }
 
+function isCargoLabelId(classId) {
+  const label = labelType(classId);
+  const key = String(label?.key || "").toLowerCase();
+  const name = String(label?.name || "");
+  return key === "cargo" || key === "goods" || name.includes("货物");
+}
+
+function nonNegativeInt(value) {
+  const number = Number.parseInt(value, 10);
+  return Number.isFinite(number) && number > 0 ? number : 0;
+}
+
+function normalizeCountFields(fields = {}) {
+  const normalized = {
+    w: nonNegativeInt(fields.w),
+    l: nonNegativeInt(fields.l),
+    h: nonNegativeInt(fields.h),
+    f: nonNegativeInt(fields.f),
+  };
+  normalized.total = normalized.w * normalized.l * normalized.h + normalized.f;
+  return normalized;
+}
+
+function ensureCountFields(ann) {
+  ann.count_fields = normalizeCountFields(ann.count_fields || {});
+  return ann.count_fields;
+}
+
 function valueAtPath(source, path) {
   return String(path || "").split(".").reduce((value, key) => (
     value && Object.prototype.hasOwnProperty.call(value, key) ? value[key] : ""
@@ -1152,6 +1180,12 @@ function annotationsForPurpose(purpose) {
 function normalizeImageModel(img) {
   if (!img) return;
   img.photo_types = img.photo_types || [];
+  img.annotations = img.annotations || [];
+  img.annotations.forEach((ann) => {
+    if (isCargoLabelId(ann.class_id)) {
+      ensureCountFields(ann);
+    }
+  });
   const purposes = Array.isArray(img.training_purposes) ? img.training_purposes : [];
   const inferredPurposes = inferredPurposesFromAnnotations(img.annotations || []);
   const validTaskIds = trainingTaskIds();
@@ -1598,6 +1632,29 @@ function renderAnnotations() {
   list.innerHTML = "";
   state.annotations.forEach((ann, index) => {
     const row = document.createElement("div");
+    const isCargo = isCargoLabelId(ann.class_id);
+    const countFields = isCargo ? ensureCountFields(ann) : null;
+    const detailHtml = isCargo ? `
+      <div class="count-fields" data-id="${escapeAttr(ann.id)}">
+        <label>W 左右
+          <input class="count-field-input" data-field="w" type="number" min="0" step="1" value="${countFields.w || ""}">
+        </label>
+        <label>L 前后
+          <input class="count-field-input" data-field="l" type="number" min="0" step="1" value="${countFields.l || ""}">
+        </label>
+        <label>H 高度
+          <input class="count-field-input" data-field="h" type="number" min="0" step="1" value="${countFields.h || ""}">
+        </label>
+        <label>F 顶层
+          <input class="count-field-input" data-field="f" type="number" min="0" step="1" value="${countFields.f || ""}">
+        </label>
+        <div class="count-total">总数 <strong>${countFields.total || 0}</strong></div>
+      </div>
+    ` : `
+      <label class="annotation-text-field">文本
+        <input class="annotation-text-input" data-id="${escapeAttr(ann.id)}" value="${escapeAttr(ann.text || "")}" placeholder="标准答案">
+      </label>
+    `;
     row.className = `annotation-row ${state.selectedAnnotationIds.includes(ann.id) ? "active" : ""}`;
     row.innerHTML = `
       <div class="annotation-row-head">
@@ -1605,21 +1662,33 @@ function renderAnnotations() {
         <button data-index="${index}" type="button">删除</button>
       </div>
       <span>任务：${taskName(ann.purpose)}</span>
-      <label class="annotation-text-field">文本
-        <input class="annotation-text-input" data-id="${escapeAttr(ann.id)}" value="${escapeAttr(ann.text || "")}" placeholder="标准答案">
-      </label>
+      ${detailHtml}
       <span>x:${Math.round(ann.x)} y:${Math.round(ann.y)} w:${Math.round(ann.width)} h:${Math.round(ann.height)}</span>
     `;
     row.onclick = (event) => {
       if (event.target.closest("button") || event.target.closest("input")) return;
       selectAnnotation(ann.id);
     };
-    row.querySelector(".annotation-text-input").oninput = (event) => {
-      ann.text = event.target.value.trim();
-      markPurposeUnreviewed(ann.purpose);
-      applyReviewRadios();
-      queueAutoSave(500);
-    };
+    const textInput = row.querySelector(".annotation-text-input");
+    if (textInput) {
+      textInput.oninput = (event) => {
+        ann.text = event.target.value.trim();
+        markPurposeUnreviewed(ann.purpose);
+        applyReviewRadios();
+        queueAutoSave(500);
+      };
+    }
+    row.querySelectorAll(".count-field-input").forEach((input) => {
+      input.oninput = () => {
+        const current = ensureCountFields(ann);
+        current[input.dataset.field] = nonNegativeInt(input.value);
+        ann.count_fields = normalizeCountFields(current);
+        row.querySelector(".count-total strong").textContent = ann.count_fields.total || 0;
+        markPurposeUnreviewed(ann.purpose);
+        applyReviewRadios();
+        queueAutoSave(500);
+      };
+    });
     row.querySelector("button").onclick = () => {
       markPurposeUnreviewed(ann.purpose);
       state.annotations.splice(index, 1);
@@ -1755,6 +1824,11 @@ function setClass(value) {
         markPurposeUnreviewed(ann.purpose);
         ann.class_id = value;
         if (classPurposes[0]) ann.purpose = classPurposes[0];
+        if (isCargoLabelId(value)) {
+          ensureCountFields(ann);
+        } else if (ann.count_fields) {
+          delete ann.count_fields;
+        }
         markPurposeUnreviewed(ann.purpose);
       }
     });
@@ -2007,7 +2081,8 @@ function drawOverlay() {
     }
     ctx.fillStyle = colors.stroke;
     const purposeText = ann.purpose ? `[${ann.purpose}] ` : "";
-    ctx.fillText(`${purposeText}${labelName(ann.class_id)}${ann.text ? " " + ann.text : ""}`, r.x + 4, Math.max(16, r.y - 5));
+    const countText = isCargoLabelId(ann.class_id) && ann.count_fields?.total ? ` ${ann.count_fields.total}` : "";
+    ctx.fillText(`${purposeText}${labelName(ann.class_id)}${countText}${ann.text ? " " + ann.text : ""}`, r.x + 4, Math.max(16, r.y - 5));
   }
   if (state.drawing) {
     const r = state.drawing;
@@ -2471,6 +2546,9 @@ function bindEvents() {
         width: Math.round(imgRect.width),
         height: Math.round(imgRect.height),
       };
+      if (isCargoLabelId(classId)) {
+        ann.count_fields = normalizeCountFields();
+      }
       state.annotations.push(ann);
       state.selectedAnnotationId = null;
       state.selectedAnnotationIds = [];
