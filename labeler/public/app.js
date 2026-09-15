@@ -2059,7 +2059,7 @@ function bindEvents() {
     };
   });
   $("downloadPageBtn").onclick = () => {
-    window.location.href = "/";
+    window.location.href = "/download";
   };
   $("logoutBtn").onclick = async () => {
     await fetch("/logout", { method: "POST" });

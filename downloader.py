@@ -891,9 +891,11 @@ def create_app(db_path: Path) -> Flask:
         if not user or not check_password_hash(user.get("password_hash", ""), password):
             return redirect(url_for("login", error="用户名或密码不正确"))
         session["user"] = username
-        target = request.args.get("next") or "/"
+        target = request.args.get("next") or "/labeler"
+        if target == "/":
+            target = "/labeler"
         if not target.startswith("/"):
-            target = "/"
+            target = "/labeler"
         return redirect(target)
 
     @app.post("/logout")
@@ -929,6 +931,10 @@ def create_app(db_path: Path) -> Flask:
 
     @app.get("/")
     def index():
+        return redirect(url_for("labeler_index"))
+
+    @app.get("/download")
+    def download_index():
         config = store.get_config()
         summary = store.summary()
         containers = store.recent_containers(40)
@@ -1051,7 +1057,7 @@ def create_app(db_path: Path) -> Flask:
                 "timeout_seconds": request.form.get("timeout_seconds", ""),
             }
         )
-        return redirect(url_for("index"))
+        return redirect(url_for("download_index"))
 
     @app.post("/jobs")
     def start_job():
@@ -1059,7 +1065,7 @@ def create_app(db_path: Path) -> Flask:
         count = int(request.form.get("count") or 0)
         if count <= 0:
             store.mark_no_record(start_id, "start_failed", "请输入下载数量")
-            return redirect(url_for("index"))
+            return redirect(url_for("download_index"))
         end_id = start_id + max(1, count) - 1
         overwrite = request.form.get("confirm_overwrite") == "1"
         existing = store.existing_containers_in_range(start_id, end_id)
@@ -1072,13 +1078,13 @@ def create_app(db_path: Path) -> Flask:
             downloader.start(start_id, end_id, overwrite=overwrite)
         except Exception as exc:
             store.mark_no_record(start_id, "start_failed", str(exc))
-        return redirect(url_for("index"))
+        return redirect(url_for("download_index"))
 
     @app.post("/jobs/cancel")
     def cancel_job():
         store.mark_latest_running_job_stopping()
         downloader.cancel()
-        return redirect(url_for("index"))
+        return redirect(url_for("download_index"))
 
     @app.get("/api/status")
     def api_status():
@@ -1162,7 +1168,7 @@ th {{ background:#edf1f3; color:#44515a; }}
 </head>
 <body>
 <main>
-  <div class="actions"><a class="button" href="/">返回首页</a></div>
+  <div class="actions"><a class="button" href="/download">返回下载页</a></div>
   <section class="panel">
     <h1>用户管理</h1>
     <form method="post" action="/users">
@@ -1443,7 +1449,7 @@ a.button {{ background:#6b7780; color:white; }}
         <input type="hidden" name="confirm_overwrite" value="1">
         <button type="submit">确认覆盖并开始</button>
       </form>
-      <a class="button" href="/">返回</a>
+      <a class="button" href="/download">返回</a>
     </div>
   </section>
 </main>
