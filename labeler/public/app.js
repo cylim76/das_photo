@@ -461,7 +461,9 @@ async function loadLabelConfig() {
 
 async function loadIndex() {
   state.index = await api("/api/index");
-  $("datasetSummary").textContent = `${state.index.container_count || 0}箱/${state.index.image_count || 0}图`;
+  if ($("datasetSummary")) {
+    $("datasetSummary").textContent = `${state.index.container_count || 0}箱/${state.index.image_count || 0}图`;
+  }
 }
 
 async function loadImages(options = {}) {
