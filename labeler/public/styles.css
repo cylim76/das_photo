@@ -336,8 +336,8 @@ button.danger:hover {
 .filters {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  padding: 8px 10px;
+  gap: 6px;
+  padding: 7px 9px;
   align-items: end;
   justify-content: flex-start;
 }
@@ -348,17 +348,17 @@ button.danger:hover {
 }
 
 .filters input {
-  width: 180px;
+  width: 142px;
 }
 
 .filters select {
-  width: 130px;
+  width: 108px;
 }
 
 .advanced-filter-toggle {
   flex: 0 0 auto;
   align-self: end;
-  padding: 6px 9px;
+  padding: 5px 8px;
   font-size: 13px;
 }
 
@@ -468,15 +468,28 @@ button.danger:hover {
 
 #yearFilter,
 #monthFilter {
-  width: 96px;
+  width: 76px;
+}
+
+#stageFilter {
+  width: 116px;
+}
+
+#purposeFilter {
+  width: 112px;
+}
+
+#statusFilter,
+#reviewFilter {
+  width: 102px;
 }
 
 #groupSizeFilter {
-  width: 86px;
+  width: 72px;
 }
 
 #groupFilter {
-  width: 184px;
+  width: 154px;
 }
 
 label {
@@ -492,7 +505,7 @@ textarea {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 6px;
-  padding: 6px 8px;
+  padding: 5px 7px;
   color: var(--ink);
   background: #fff;
 }
