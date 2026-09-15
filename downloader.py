@@ -1223,7 +1223,7 @@ h2 {{ margin:0 0 14px; font-size:17px; }}
 main {{ padding:18px 28px 36px; }}
 .grid {{ display:block; }}
 .panel {{ background:white; border:1px solid #d8e0e5; border-radius:6px; padding:15px; margin-bottom:14px; }}
-.stats {{ display:grid; grid-template-columns: repeat(4, minmax(130px, 1fr)); gap:10px; margin-bottom:14px; }}
+.stats {{ display:grid; grid-template-columns: repeat(5, minmax(130px, 1fr)); gap:10px; margin-bottom:14px; }}
 .stat {{ background:white; border:1px solid #d8e0e5; border-radius:6px; padding:11px 12px; color:#5a6872; }}
 .stat b {{ display:block; font-size:21px; margin-top:4px; color:#14252d; }}
 label {{ display:block; font-size:13px; color:#51606b; margin-bottom:5px; }}
@@ -1285,7 +1285,9 @@ setInterval(() => {{
     const pct = j.total ? Math.min(100, Math.round((j.processed || 0) * 1000 / j.total) / 10) : 0;
     document.getElementById('job-bar').style.width = pct + '%';
     document.getElementById('max-done').textContent = s.max_completed_id || '';
-    document.getElementById('max-photo').textContent = s.max_with_photos_id || '';
+    const maxPhoto = document.getElementById('max-photo');
+    if (maxPhoto) maxPhoto.textContent = s.max_with_photos_id || '';
+    document.getElementById('download-containers').textContent = s.containers || 0;
   }}).catch(() => {{}});
 }}, 2500);
 </script>
@@ -1307,6 +1309,7 @@ setInterval(() => {{
   <section class="stats">
     <div class="stat">下次开始 ID <b>{next_start_id}</b></div>
     <div class="stat">上次完成 ID <b id="max-done">{summary.get("max_completed_id") or ""}</b></div>
+    <div class="stat">箱数 <b id="download-containers">{summary.get("containers") or 0}</b></div>
     <div class="stat">已保存照片 <b>{summary.get("photo_files") or 0}</b></div>
     <div class="stat">当前任务 <b id="job-status">{html.escape(str(job.get("status") or "无"))}</b></div>
   </section>
