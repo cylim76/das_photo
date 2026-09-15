@@ -2083,6 +2083,10 @@ function bindEvents() {
     setBrandMenu($("brandMenu")?.hidden !== false);
   };
   $("brandMenu").onclick = (event) => event.stopPropagation();
+  $("workbenchMenuBtn").onclick = () => {
+    closeBrandMenu();
+    setView("workbench");
+  };
   document.querySelectorAll(".config-tab").forEach((btn) => {
     btn.onclick = () => {
       state.labelConfig = collectLabelConfigFromSettings();
