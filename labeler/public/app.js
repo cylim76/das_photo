@@ -87,28 +87,26 @@ function setLog(message) {
   $("settingsLog").textContent = typeof message === "string" ? message : JSON.stringify(message, null, 2);
 }
 
-let toastTimer = null;
-
 function showToast(text, mode = "success", timeout = null) {
   const host = $("toastHost");
   if (!host || !text) return;
-  clearTimeout(toastTimer);
-  host.innerHTML = "";
   const item = document.createElement("div");
   item.className = `toast ${mode || "success"}`;
   item.textContent = text;
   host.appendChild(item);
-  const delay = timeout || (mode === "error" ? 5000 : mode === "warn" ? 3500 : 2200);
-  toastTimer = setTimeout(() => {
-    item.remove();
+  const delay = timeout || (mode === "error" ? 2600 : mode === "warn" ? 2200 : 1200);
+  window.setTimeout(() => {
+    item.classList.add("leaving");
+    item.addEventListener("animationend", () => item.remove(), { once: true });
   }, delay);
 }
 
 function setSaveStatus(text, mode = "") {
   const el = $("saveStatus");
-  if (!el) return;
-  el.textContent = text;
-  el.className = `save-status ${mode}`.trim();
+  if (el) {
+    el.textContent = text;
+    el.className = `save-status ${mode}`.trim();
+  }
   if (mode !== "saving" && text) {
     showToast(text, mode || "success");
   }
@@ -1551,7 +1549,6 @@ function renderCurrent() {
   renderTaskOverlay();
   renderAnnotations();
   state.isRendering = false;
-  setSaveStatus("已保存");
 }
 
 function formatDasMeta(img) {
