@@ -1024,6 +1024,29 @@ textarea {
   color: var(--accent);
 }
 
+.annotation-row-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.annotation-row-head button {
+  padding: 4px 7px;
+  font-size: 12px;
+}
+
+.annotation-text-field {
+  display: grid;
+  gap: 3px;
+  color: var(--muted);
+}
+
+.annotation-text-input {
+  padding: 5px 7px;
+  font-size: 12px;
+}
+
 .settings-grid {
   max-width: 1120px;
   display: grid;

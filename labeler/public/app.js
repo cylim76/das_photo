@@ -1545,7 +1545,6 @@ function renderCurrent() {
   updateActivePurposeControls();
   applyStatusRadios();
   applyReviewRadios();
-  $("textInput").value = "";
   renderTaskOverlay();
   renderAnnotations();
   state.isRendering = false;
@@ -1569,15 +1568,25 @@ function renderAnnotations() {
     const row = document.createElement("div");
     row.className = `annotation-row ${state.selectedAnnotationIds.includes(ann.id) ? "active" : ""}`;
     row.innerHTML = `
-      <strong>${index + 1}. ${labelName(ann.class_id)}</strong>
+      <div class="annotation-row-head">
+        <strong>${index + 1}. ${labelName(ann.class_id)}</strong>
+        <button data-index="${index}" type="button">删除</button>
+      </div>
       <span>任务：${taskName(ann.purpose)}</span>
-      <span>${ann.text || ""}</span>
+      <label class="annotation-text-field">文本
+        <input class="annotation-text-input" data-id="${escapeAttr(ann.id)}" value="${escapeAttr(ann.text || "")}" placeholder="标准答案">
+      </label>
       <span>x:${Math.round(ann.x)} y:${Math.round(ann.y)} w:${Math.round(ann.width)} h:${Math.round(ann.height)}</span>
-      <button data-index="${index}">删除</button>
     `;
     row.onclick = (event) => {
-      if (event.target.tagName.toLowerCase() === "button") return;
+      if (event.target.closest("button") || event.target.closest("input")) return;
       selectAnnotation(ann.id);
+    };
+    row.querySelector(".annotation-text-input").oninput = (event) => {
+      ann.text = event.target.value.trim();
+      markPurposeUnreviewed(ann.purpose);
+      applyReviewRadios();
+      queueAutoSave(500);
     };
     row.querySelector("button").onclick = () => {
       markPurposeUnreviewed(ann.purpose);
@@ -1606,7 +1615,6 @@ function selectAnnotation(id) {
     const classRadio = document.querySelector(`input[name='classRadio'][value='${ann.class_id}']`);
     if (classRadio) classRadio.checked = true;
     if (ann.purpose) setActivePurpose(ann.purpose);
-    $("textInput").value = ann.text || "";
   }
   renderAnnotations();
   drawOverlay();
@@ -1619,9 +1627,6 @@ function selectAnnotations(ids) {
   if (ann) {
     const classRadio = document.querySelector(`input[name='classRadio'][value='${ann.class_id}']`);
     if (classRadio) classRadio.checked = true;
-    $("textInput").value = state.selectedAnnotationIds.length === 1 ? (ann.text || "") : "";
-  } else {
-    $("textInput").value = "";
   }
   renderAnnotations();
   drawOverlay();
@@ -2219,16 +2224,6 @@ function bindEvents() {
   document.querySelectorAll("input[name='reviewRadio']").forEach((radio) => {
     radio.onchange = () => setReviewStatus(radio.value);
   });
-  $("textInput").oninput = () => {
-    if (state.selectedAnnotationIds.length !== 1) return;
-    const ann = selectedAnnotation();
-    if (!ann) return;
-    ann.text = $("textInput").value.trim();
-    markPurposeUnreviewed(ann.purpose);
-    applyReviewRadios();
-    renderAnnotations();
-    queueAutoSave(500);
-  };
   $("notesInput").oninput = () => queueAutoSave(700);
   $("imageList").addEventListener("wheel", (event) => {
     const list = $("imageList");
@@ -2417,7 +2412,7 @@ function bindEvents() {
       const classId = selectedClassId();
       const classPurposes = ensurePurposesForClass(classId);
       const annPurpose = classPurposes[0] || activePurpose();
-      const annText = $("textInput").value.trim() || defaultTextForClass(classId);
+      const annText = defaultTextForClass(classId);
       const ann = {
         id: crypto.randomUUID(),
         type: "bbox",
