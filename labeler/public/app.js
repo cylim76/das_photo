@@ -476,6 +476,7 @@ async function loadImages(options = {}) {
   const reviewStatus = $("reviewFilter")?.value || "";
   const groupSize = $("groupSizeFilter")?.value || "";
   const group = $("groupFilter")?.value || "";
+  const effectiveGroup = groupSize ? (group || "1") : "";
   const search = $("searchInput").value.trim();
   if (year) params.set("year", year);
   if (month) params.set("month", month);
@@ -484,7 +485,7 @@ async function loadImages(options = {}) {
   if (status) params.set("status", status);
   if (reviewStatus) params.set("review_status", reviewStatus);
   if (groupSize) params.set("group_size", groupSize);
-  if (groupSize && group) params.set("group", group);
+  if (groupSize && effectiveGroup) params.set("group", effectiveGroup);
   if (search) params.set("search", search);
   const advancedFilters = collectAdvancedFilters();
   if (advancedFilters.length) params.set("advanced", JSON.stringify(advancedFilters));
@@ -578,7 +579,9 @@ function renderGroupFilters() {
     groupSelect.appendChild(option);
   });
   groupSelect.disabled = !groupSizeSelect.value || !groups.length;
-  groupSelect.value = groups.some((group) => String(group.index) === current) ? current : "";
+  groupSelect.value = groups.some((group) => String(group.index) === current)
+    ? current
+    : groupSizeSelect.value && groups.length ? String(groups[0].index) : "";
 }
 
 function bindPurposeCheckboxes() {
