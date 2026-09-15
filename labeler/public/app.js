@@ -2,6 +2,7 @@ const state = {
   config: null,
   index: null,
   periods: { years: [] },
+  groups: [],
   summary: null,
   images: [],
   currentIndex: -1,
@@ -20,6 +21,7 @@ const state = {
   pendingSaveSnapshot: null,
   saveSeq: 0,
   labelConfig: null,
+  currentUser: "",
   selectedLabelId: "",
   advancedFilterReady: false,
   zoom: 1,
@@ -441,6 +443,17 @@ async function loadConfig() {
   $("photoRootInput").value = state.config.photo_root;
 }
 
+async function loadSession() {
+  try {
+    const data = await api("/api/session");
+    state.currentUser = data.user || "";
+  } catch (err) {
+    state.currentUser = "";
+  }
+  const el = $("currentUserMeta");
+  if (el) el.textContent = state.currentUser ? `用户 ${state.currentUser}` : "";
+}
+
 async function loadLabelConfig() {
   state.labelConfig = await api("/api/label-config");
   renderLabelConfigControls();
@@ -461,6 +474,8 @@ async function loadImages(options = {}) {
   const purpose = $("purposeFilter").value;
   const status = $("statusFilter").value;
   const reviewStatus = $("reviewFilter")?.value || "";
+  const groupSize = $("groupSizeFilter")?.value || "";
+  const group = $("groupFilter")?.value || "";
   const search = $("searchInput").value.trim();
   if (year) params.set("year", year);
   if (month) params.set("month", month);
@@ -468,6 +483,8 @@ async function loadImages(options = {}) {
   if (purpose) params.set("purpose", purpose);
   if (status) params.set("status", status);
   if (reviewStatus) params.set("review_status", reviewStatus);
+  if (groupSize) params.set("group_size", groupSize);
+  if (groupSize && group) params.set("group", group);
   if (search) params.set("search", search);
   const advancedFilters = collectAdvancedFilters();
   if (advancedFilters.length) params.set("advanced", JSON.stringify(advancedFilters));
@@ -481,6 +498,7 @@ async function loadImages(options = {}) {
     state.images.some((img) => batchKey(img) === key)
   )));
   state.summary = data.summary || null;
+  state.groups = state.summary?.groups || [];
   if (stage && state.summary) {
     const seen = new Set();
     const containers = [];
@@ -502,6 +520,7 @@ async function loadImages(options = {}) {
   }
   state.periods = data.periods || state.periods;
   renderPeriodFilters();
+  renderGroupFilters();
   renderProgress();
   renderImageList();
   updateBatchToolbar();
@@ -543,6 +562,23 @@ function renderPeriodFilters() {
     monthSelect.appendChild(option);
   });
   monthSelect.value = months.includes(currentMonth) ? currentMonth : "";
+}
+
+function renderGroupFilters() {
+  const groupSizeSelect = $("groupSizeFilter");
+  const groupSelect = $("groupFilter");
+  if (!groupSizeSelect || !groupSelect) return;
+  const current = groupSelect.value;
+  const groups = state.groups || [];
+  groupSelect.innerHTML = '<option value="">全部组</option>';
+  groups.forEach((group) => {
+    const option = document.createElement("option");
+    option.value = String(group.index);
+    option.textContent = group.label;
+    groupSelect.appendChild(option);
+  });
+  groupSelect.disabled = !groupSizeSelect.value || !groups.length;
+  groupSelect.value = groups.some((group) => String(group.index) === current) ? current : "";
 }
 
 function bindPurposeCheckboxes() {
@@ -740,6 +776,8 @@ function collectCurrentFilterPayload() {
     purpose: $("purposeFilter").value,
     status: $("statusFilter").value,
     review_status: $("reviewFilter")?.value || "",
+    group_size: $("groupSizeFilter")?.value || "",
+    group: $("groupFilter")?.value || "",
     search: $("searchInput").value.trim(),
   };
   const advanced = collectAdvancedFilters();
@@ -1182,7 +1220,7 @@ function setActivePurpose(value, shouldSave = false) {
     review_status: REVIEW_STATUSES.includes(previousState?.review_status) ? previousState.review_status : "unreviewed",
     updated_at: typeof previousState === "object" ? previousState.updated_at || null : null,
     reviewed_at: typeof previousState === "object" ? previousState.reviewed_at || null : null,
-    updated_by: typeof previousState === "object" ? previousState.updated_by || null : null,
+    updated_by: state.currentUser || (typeof previousState === "object" ? previousState.updated_by || null : null),
     reviewed_by: typeof previousState === "object" ? previousState.reviewed_by || null : null,
   };
   state.currentImage.active_purpose = value;
@@ -1215,7 +1253,7 @@ function setReviewStatus(value, shouldSave = true) {
     updated_at: typeof previousState === "object" ? previousState.updated_at || null : null,
     reviewed_at: value === "reviewed" ? new Date().toISOString() : null,
     updated_by: typeof previousState === "object" ? previousState.updated_by || null : null,
-    reviewed_by: value === "reviewed" ? "current_user" : null,
+    reviewed_by: value === "reviewed" ? state.currentUser || "current_user" : null,
   };
   if (shouldSave) queueAutoSave();
   return true;
@@ -1225,14 +1263,6 @@ function removeTrainingPurpose(value, shouldSave = false, options = {}) {
   if (!state.currentImage) return false;
   const deleteAnnotations = options.deleteAnnotations !== false;
   const relatedAnnotations = deleteAnnotations ? annotationsForPurpose(value) : [];
-  if (relatedAnnotations.length && options.confirmDelete !== false) {
-    const message = `取消训练任务「${taskName(value)}」会删除 ${relatedAnnotations.length} 个关联标签框，确定继续吗？`;
-    if (!window.confirm(message)) {
-      updateActivePurposeControls();
-      applyStatusRadios();
-      return false;
-    }
-  }
   if (relatedAnnotations.length) {
     const relatedIds = new Set(relatedAnnotations.map((ann) => ann.id));
     state.annotations = state.annotations.filter((ann) => !relatedIds.has(ann.id));
@@ -1389,6 +1419,7 @@ function createSaveSnapshot() {
     purpose_states: cloneJson(state.currentImage.purpose_states || {}),
     annotations: cloneJson(state.annotations || []),
     notes: $("notesInput").value,
+    user: state.currentUser || "",
   };
   return {
     key: imageKey(payload.container_no, payload.file_name),
@@ -1628,7 +1659,7 @@ function setStatus(value, shouldSave = true) {
     review_status: "unreviewed",
     updated_at: new Date().toISOString(),
     reviewed_at: null,
-    updated_by: typeof previousState === "object" ? previousState.updated_by || null : null,
+    updated_by: state.currentUser || (typeof previousState === "object" ? previousState.updated_by || null : null),
     reviewed_by: null,
   };
   state.currentImage.status = value;
@@ -2025,6 +2056,10 @@ function bindEvents() {
   $("downloadPageBtn").onclick = () => {
     window.location.href = "/";
   };
+  $("logoutBtn").onclick = async () => {
+    await fetch("/logout", { method: "POST" });
+    window.location.href = "/login";
+  };
   $("saveConfigBtn").onclick = async () => {
     const config = await api("/api/config", { method: "POST", body: JSON.stringify({ photo_root: $("photoRootInput").value }) });
     setLog(config);
@@ -2083,33 +2118,49 @@ function bindEvents() {
   $("purposeFilter").onchange = () => {
     if ($("batchPurposeSelect")) $("batchPurposeSelect").value = $("purposeFilter").value;
     if ($("resetTaskSelect")) $("resetTaskSelect").value = $("purposeFilter").value;
+    $("groupFilter").value = "";
     state.currentIndex = -1;
     loadImages();
   };
   $("statusFilter").onchange = () => {
+    $("groupFilter").value = "";
     state.currentIndex = -1;
     loadImages();
   };
   $("reviewFilter").onchange = () => {
+    $("groupFilter").value = "";
+    state.currentIndex = -1;
+    loadImages();
+  };
+  $("groupSizeFilter").onchange = () => {
+    $("groupFilter").value = "";
+    state.currentIndex = -1;
+    loadImages();
+  };
+  $("groupFilter").onchange = () => {
     state.currentIndex = -1;
     loadImages();
   };
   $("yearFilter").onchange = () => {
     $("monthFilter").value = "";
+    $("groupFilter").value = "";
     state.currentIndex = -1;
     loadImages();
   };
   $("monthFilter").onchange = () => {
+    $("groupFilter").value = "";
     state.currentIndex = -1;
     loadImages();
   };
   $("stageFilter").onchange = () => {
+    $("groupFilter").value = "";
     state.currentIndex = -1;
     loadImages();
   };
   $("searchInput").oninput = () => {
     clearTimeout(state.searchTimer);
     state.searchTimer = setTimeout(() => {
+      $("groupFilter").value = "";
       state.currentIndex = -1;
       loadImages();
     }, 250);
@@ -2469,6 +2520,7 @@ async function init() {
   bindEvents();
   setThumbSize(state.thumbSize);
   updateBatchToolbar();
+  await loadSession();
   await loadConfig();
   await loadLabelConfig();
   await loadIndex();

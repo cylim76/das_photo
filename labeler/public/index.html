@@ -78,14 +78,33 @@
 
 
 
+        <label>每组箱数
+          <select id="groupSizeFilter">
+            <option value="">全部</option>
+            <option value="10">10</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+            <option value="200">200</option>
+            <option value="300">300</option>
+          </select>
+        </label>
+
+        <label>分组
+          <select id="groupFilter" disabled>
+            <option value="">全部组</option>
+          </select>
+        </label>
+
         <button id="advancedFilterToggle" class="advanced-filter-toggle" type="button">高级筛选</button>
 
         <nav class="tabs">
           <span id="datasetSummary" class="dataset-summary">未扫描</span>
           <span id="saveStatus" class="save-status">已保存</span>
+          <span id="currentUserMeta" class="dataset-summary"></span>
           <button class="tab nav-link" id="downloadPageBtn">下载</button>
           <button class="tab active" data-view="workbench">标注</button>
           <button class="tab" data-view="settings">设置</button>
+          <button class="tab" id="logoutBtn" type="button">退出</button>
         </nav>
       </section>
     </header>

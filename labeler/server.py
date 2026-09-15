@@ -947,9 +947,201 @@ def progress_summary(params):
     }
 
 
+def container_cpm_id(container):
+    value = container.get("das_container_id") or container.get("cpm_id") or container.get("id")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def group_size_from_params(params):
+    try:
+        size = int(params.get("group_size", ["0"])[0] or 0)
+    except ValueError:
+        return 0
+    return size if size in {10, 50, 100, 200, 300} else 0
+
+
+def group_index_from_params(params):
+    try:
+        return int(params.get("group", ["0"])[0] or 0)
+    except ValueError:
+        return 0
+
+
+def filtered_container_rows(params):
+    root = Path(get_config()["photo_root"])
+    rows = []
+    for container in load_index().get("containers", []):
+        data = read_json(root / container["json_path"], {})
+        matched_images = [
+            img for img in data.get("images", [])
+            if image_matches_filter_params(img, container, params)
+        ]
+        if matched_images:
+            rows.append({
+                "container": container,
+                "cpm_id": container_cpm_id(container),
+                "images": matched_images,
+            })
+    return sorted(rows, key=lambda row: (
+        row["cpm_id"] is None,
+        row["cpm_id"] if row["cpm_id"] is not None else 0,
+        row["container"].get("container_no", ""),
+    ))
+
+
+def build_container_groups(container_rows, group_size):
+    if not group_size:
+        return []
+    groups = []
+    for offset in range(0, len(container_rows), group_size):
+        chunk = container_rows[offset:offset + group_size]
+        cpm_values = [row["cpm_id"] for row in chunk if row["cpm_id"] is not None]
+        start_cpm = min(cpm_values) if cpm_values else None
+        end_cpm = max(cpm_values) if cpm_values else None
+        index = len(groups) + 1
+        if start_cpm is not None and end_cpm is not None:
+            label = f"第{index}组 ({start_cpm}-{end_cpm}, {len(chunk)}箱)"
+        else:
+            label = f"第{index}组 ({len(chunk)}箱)"
+        groups.append({
+            "index": index,
+            "label": label,
+            "start_cpm_id": start_cpm,
+            "end_cpm_id": end_cpm,
+            "container_count": len(chunk),
+        })
+    return groups
+
+
+def apply_group_filter(container_rows, params):
+    group_size = group_size_from_params(params)
+    group_index = group_index_from_params(params)
+    if not group_size or group_index <= 0:
+        return container_rows
+    start = (group_index - 1) * group_size
+    end = start + group_size
+    if start >= len(container_rows):
+        return []
+    return container_rows[start:end]
+
+
+def image_response_row(container, img, purpose):
+    row_status = image_purpose_status(img, purpose) if purpose else ""
+    row_review_status = image_review_status(img, purpose) if purpose else ""
+    return {
+        "container_no": container.get("container_no"),
+        "das_container_id": container.get("das_container_id"),
+        "seal_no": container.get("seal_no"),
+        "begin_date": container.get("begin_date"),
+        "product_type": container.get("product_type"),
+        "packing_type": container.get("packing_type"),
+        "container_path": container.get("path"),
+        "file_name": img.get("file_name"),
+        "dataset_path": img.get("dataset_path"),
+        "image_width": img.get("image_width"),
+        "image_height": img.get("image_height"),
+        "das": img.get("das", {}),
+        "stage": img.get("stage"),
+        "stage_name": img.get("stage_name"),
+        "photo_types": img.get("photo_types", []),
+        "training_purposes": img.get("training_purposes", []),
+        "active_purpose": img.get("active_purpose", ""),
+        "purpose_states": img.get("purpose_states", {}),
+        "status": row_status,
+        "review_status": row_review_status,
+        "annotation_count": len(img.get("annotations", [])),
+    }
+
+
+def apply_user_to_purpose_states(states, user):
+    if not user or not isinstance(states, dict):
+        return states
+    for value in states.values():
+        if not isinstance(value, dict):
+            continue
+        if value.get("updated_at"):
+            value["updated_by"] = user
+        if value.get("reviewed_at") or value.get("reviewed_by") == "current_user":
+            value["reviewed_by"] = user
+    return states
+
+
+def list_images(params):
+    purpose = params.get("purpose", [""])[0]
+    limit = int(params.get("limit", ["300"])[0] or 300)
+    rows = []
+    for container_row in apply_group_filter(filtered_container_rows(params), params):
+        container = container_row["container"]
+        for img in container_row["images"]:
+            rows.append(image_response_row(container, img, purpose))
+            if limit > 0 and len(rows) >= limit:
+                return rows
+    return rows
+
+
+def progress_summary(params):
+    purpose = params.get("purpose", [""])[0]
+    group_size = group_size_from_params(params)
+    group_index = group_index_from_params(params)
+    base_rows = filtered_container_rows(params)
+    groups = build_container_groups(base_rows, group_size)
+    active_rows = apply_group_filter(base_rows, params)
+    status_counts = {}
+    review_counts = {}
+    purpose_counts = {}
+    total_images = 0
+    container_rows = []
+
+    for row in active_rows:
+        container = row["container"]
+        matched_in_container = len(row["images"])
+        total_images += matched_in_container
+        for img in row["images"]:
+            if purpose:
+                status_value = image_purpose_status(img, purpose)
+                status_counts[status_value] = status_counts.get(status_value, 0) + 1
+                review_value = image_review_status(img, purpose)
+                review_counts[review_value] = review_counts.get(review_value, 0) + 1
+            else:
+                for p in img.get("training_purposes") or []:
+                    status_value = image_purpose_status(img, p)
+                    status_counts[status_value] = status_counts.get(status_value, 0) + 1
+                    review_value = image_review_status(img, p)
+                    review_counts[review_value] = review_counts.get(review_value, 0) + 1
+            for p in img.get("training_purposes") or []:
+                purpose_counts[p] = purpose_counts.get(p, 0) + 1
+        container_rows.append({
+            "container_no": container.get("container_no"),
+            "das_container_id": container.get("das_container_id"),
+            "path": container.get("path"),
+            "period": container.get("period", {}),
+            "matched_images": matched_in_container,
+        })
+
+    return {
+        "year": params.get("year", [""])[0],
+        "month": params.get("month", [""])[0],
+        "stage": params.get("stage", [""])[0],
+        "purpose": purpose,
+        "container_count": len(active_rows),
+        "image_count": total_images,
+        "status_counts": status_counts,
+        "review_counts": review_counts,
+        "purpose_counts": purpose_counts,
+        "containers": container_rows,
+        "groups": groups,
+        "group_size": group_size,
+        "active_group": group_index,
+    }
+
+
 def update_image(payload):
     container_no = payload.get("container_no")
     file_name = payload.get("file_name")
+    user = str(payload.get("user") or "").strip()
     if not container_no or not file_name:
         raise ValueError("缺少 container_no 或 file_name")
     data, path = load_container(container_no)
@@ -965,7 +1157,10 @@ def update_image(payload):
             img["photo_types"] = payload.get("photo_types", img.get("photo_types", []))
             img["training_purposes"] = payload.get("training_purposes", img.get("training_purposes", []))
             img["active_purpose"] = payload.get("active_purpose", img.get("active_purpose", ""))
-            img["purpose_states"] = payload.get("purpose_states", img.get("purpose_states", {}))
+            img["purpose_states"] = apply_user_to_purpose_states(
+                payload.get("purpose_states", img.get("purpose_states", {})),
+                user,
+            )
             img["annotations"] = payload.get("annotations", img.get("annotations", []))
             img["ocr_targets"] = payload.get("ocr_targets", img.get("ocr_targets", []))
             img["notes"] = payload.get("notes", img.get("notes", ""))
@@ -981,6 +1176,7 @@ def batch_update_status(payload):
     purpose = str(payload.get("purpose") or "").strip()
     status = str(payload.get("status") or "").strip()
     action = str(payload.get("action") or "").strip()
+    user = str(payload.get("user") or "").strip() or None
     if not items or not purpose or (action != "unassign" and status not in TASK_STATUSES):
         raise ValueError("缺少批量处理参数")
 
@@ -1031,7 +1227,7 @@ def batch_update_status(payload):
                 "review_status": "unreviewed",
                 "updated_at": now_iso(),
                 "reviewed_at": None,
-                "updated_by": previous.get("updated_by") if isinstance(previous, dict) else None,
+                "updated_by": user or (previous.get("updated_by") if isinstance(previous, dict) else None),
                 "reviewed_by": None,
             }
             img["updated_at"] = now_iso()
@@ -1063,14 +1259,23 @@ def reset_task_by_filters(payload):
     purpose = str(payload.get("purpose") or "").strip()
     action = str(payload.get("action") or "").strip()
     params = params_from_payload_filters(payload.get("filters") or {})
+    user = str(payload.get("user") or "").strip() or None
     if not purpose or action not in {"reset_pending", "remove_task"}:
         raise ValueError("缺少任务重置参数")
 
     root = Path(get_config()["photo_root"])
+    grouped_container_nos = None
+    if group_size_from_params(params) and group_index_from_params(params):
+        grouped_container_nos = {
+            row["container"].get("container_no")
+            for row in apply_group_filter(filtered_container_rows(params), params)
+        }
     updated_count = 0
     removed_annotations = 0
     touched_containers = 0
     for container in load_index().get("containers", []):
+        if grouped_container_nos is not None and container.get("container_no") not in grouped_container_nos:
+            continue
         data = read_json(root / container["json_path"], {})
         changed = False
         for img in data.get("images", []):
@@ -1101,7 +1306,7 @@ def reset_task_by_filters(payload):
                     "review_status": "unreviewed",
                     "updated_at": now_iso(),
                     "reviewed_at": None,
-                    "updated_by": previous.get("updated_by") if isinstance(previous, dict) else None,
+                    "updated_by": user or (previous.get("updated_by") if isinstance(previous, dict) else None),
                     "reviewed_by": None,
                 }
                 img["active_purpose"] = purpose

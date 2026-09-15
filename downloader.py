@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import html
+import json
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import signal
 import sqlite3
@@ -19,7 +22,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, redirect, request, send_file, url_for
+from flask import Flask, Response, jsonify, redirect, request, send_file, session, url_for
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from labeler import server as labeler_server
 
@@ -35,6 +39,8 @@ LABELER_PUBLIC_DIR = TOOLS_DIR / "labeler" / "public"
 DEFAULT_BASE_URL = "http://das.china.lge.com:7005"
 DETAIL_PATH = "/Manage/cpm/V_CPM_DETAIL.aspx?cpm_id={cpm_id}"
 DAS_LOGIN_SSO_URL = "http://das.china.lge.com:7005/LoginSSO.aspx"
+USERS_PATH = DEFAULT_DATA_DIR / "users.json"
+SECRET_KEY_PATH = DEFAULT_DATA_DIR / "secret_key.txt"
 
 
 def is_foreign_windows_path(value: str) -> bool:
@@ -46,6 +52,54 @@ def resolve_photo_dir(value: str | None = None) -> Path:
     if not text or is_foreign_windows_path(text):
         return DEFAULT_PHOTO_DIR
     return Path(text).expanduser()
+
+
+def read_json_file(path: Path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def write_json_file(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def get_secret_key() -> str:
+    DEFAULT_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    env_key = os.environ.get("DAS_PHOTO_SECRET_KEY", "").strip()
+    if env_key:
+        return env_key
+    if SECRET_KEY_PATH.exists():
+        return SECRET_KEY_PATH.read_text(encoding="utf-8").strip()
+    key = secrets.token_hex(32)
+    SECRET_KEY_PATH.write_text(key, encoding="utf-8")
+    return key
+
+
+def ensure_users() -> dict:
+    users = read_json_file(USERS_PATH, {})
+    if users:
+        return users
+    username = os.environ.get("DAS_PHOTO_ADMIN_USER", "admin").strip() or "admin"
+    password = os.environ.get("DAS_PHOTO_ADMIN_PASSWORD", "admin123").strip() or "admin123"
+    users = {
+        username: {
+            "name": username,
+            "password_hash": generate_password_hash(password),
+            "role": "admin",
+            "created_at": now_text(),
+        }
+    }
+    write_json_file(USERS_PATH, users)
+    return users
+
+
+def current_user_name() -> str:
+    return str(session.get("user") or "").strip()
 
 
 STEP_INFO = {
@@ -804,6 +858,74 @@ def create_app(db_path: Path) -> Flask:
     store = Store(db_path)
     downloader = Downloader(store)
     app = Flask(__name__)
+    app.secret_key = get_secret_key()
+
+    def is_logged_in() -> bool:
+        return bool(session.get("user"))
+
+    def wants_json() -> bool:
+        return request.path.startswith("/api/") or request.path.startswith("/labeler/api/")
+
+    @app.before_request
+    def require_login():
+        if request.path in {"/login"}:
+            return None
+        if is_logged_in():
+            return None
+        if wants_json():
+            return jsonify({"error": "请先登录"}), 401
+        return redirect(url_for("login", next=request.full_path if request.query_string else request.path))
+
+    @app.get("/login")
+    def login():
+        ensure_users()
+        error = request.args.get("error", "")
+        return Response(render_login_page(error), mimetype="text/html; charset=utf-8")
+
+    @app.post("/login")
+    def login_post():
+        users = ensure_users()
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        user = users.get(username)
+        if not user or not check_password_hash(user.get("password_hash", ""), password):
+            return redirect(url_for("login", error="用户名或密码不正确"))
+        session["user"] = username
+        target = request.args.get("next") or "/"
+        if not target.startswith("/"):
+            target = "/"
+        return redirect(target)
+
+    @app.post("/logout")
+    def logout():
+        session.clear()
+        return redirect(url_for("login"))
+
+    @app.get("/users")
+    def users_page():
+        users = ensure_users()
+        return Response(render_users_page(users), mimetype="text/html; charset=utf-8")
+
+    @app.post("/users")
+    def save_user():
+        users = ensure_users()
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        if username and password:
+            current = users.get(username, {})
+            users[username] = {
+                "name": username,
+                "password_hash": generate_password_hash(password),
+                "role": current.get("role", "operator"),
+                "created_at": current.get("created_at", now_text()),
+                "updated_at": now_text(),
+            }
+            write_json_file(USERS_PATH, users)
+        return redirect(url_for("users_page"))
+
+    @app.get("/labeler/api/session")
+    def labeler_session():
+        return jsonify({"user": current_user_name()})
 
     @app.get("/")
     def index():
@@ -883,17 +1005,23 @@ def create_app(db_path: Path) -> Flask:
     @app.post("/labeler/api/image")
     def labeler_update_image():
         sync_labeler_photo_root()
-        return jsonify(labeler_server.update_image(request.get_json(silent=True) or {}))
+        payload = request.get_json(silent=True) or {}
+        payload["user"] = current_user_name()
+        return jsonify(labeler_server.update_image(payload))
 
     @app.post("/labeler/api/images/batch-status")
     def labeler_batch_status():
         sync_labeler_photo_root()
-        return jsonify(labeler_server.batch_update_status(request.get_json(silent=True) or {}))
+        payload = request.get_json(silent=True) or {}
+        payload["user"] = current_user_name()
+        return jsonify(labeler_server.batch_update_status(payload))
 
     @app.post("/labeler/api/task-reset")
     def labeler_task_reset():
         sync_labeler_photo_root()
-        return jsonify(labeler_server.reset_task_by_filters(request.get_json(silent=True) or {}))
+        payload = request.get_json(silent=True) or {}
+        payload["user"] = current_user_name()
+        return jsonify(labeler_server.reset_task_by_filters(payload))
 
     @app.get("/labeler/media")
     def labeler_media():
@@ -966,6 +1094,96 @@ def create_app(db_path: Path) -> Flask:
     return app
 
 
+def render_login_page(error: str = "") -> str:
+    error_html = f'<div class="error">{html.escape(error)}</div>' if error else ""
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DAS 照片工具登录</title>
+<style>
+body {{ margin:0; min-height:100vh; display:grid; place-items:center; font-family: Arial, "Microsoft YaHei", sans-serif; background:#eef3f5; color:#18242c; }}
+.card {{ width:min(380px, calc(100vw - 32px)); background:white; border:1px solid #d8e0e5; border-radius:8px; padding:24px; box-shadow:0 18px 48px rgba(20,32,40,0.16); }}
+h1 {{ margin:0 0 18px; font-size:22px; }}
+label {{ display:block; margin:12px 0 6px; color:#51606b; font-size:13px; }}
+input {{ box-sizing:border-box; width:100%; padding:10px; border:1px solid #bcc7ce; border-radius:5px; font-size:15px; }}
+button {{ width:100%; margin-top:18px; border:0; border-radius:5px; background:#1f6f78; color:white; padding:11px 15px; font-weight:700; cursor:pointer; }}
+.error {{ margin-bottom:12px; padding:9px 10px; border:1px solid #e8a9b4; border-radius:5px; background:#f7d6dc; color:#8a1f2d; }}
+.hint {{ margin-top:14px; color:#6b7780; font-size:12px; line-height:1.6; }}
+</style>
+</head>
+<body>
+  <form class="card" method="post">
+    <h1>DAS 照片工具登录</h1>
+    {error_html}
+    <label>用户名</label>
+    <input name="username" autocomplete="username" autofocus>
+    <label>密码</label>
+    <input name="password" type="password" autocomplete="current-password">
+    <button type="submit">登录</button>
+    <div class="hint">首次启动默认账号为 admin，默认密码为 admin123。上线后请尽快修改 data/users.json 或使用环境变量初始化账号。</div>
+  </form>
+</body>
+</html>"""
+
+
+def render_users_page(users: dict) -> str:
+    rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(name)}</td>"
+        f"<td>{html.escape(info.get('role') or '')}</td>"
+        f"<td>{html.escape(info.get('created_at') or '')}</td>"
+        f"<td>{html.escape(info.get('updated_at') or '')}</td>"
+        "</tr>"
+        for name, info in sorted(users.items())
+    )
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>用户管理</title>
+<style>
+body {{ margin:0; font-family: Arial, "Microsoft YaHei", sans-serif; background:#f4f6f8; color:#18242c; }}
+main {{ max-width:920px; margin:0 auto; padding:24px; }}
+.panel {{ background:white; border:1px solid #d8e0e5; border-radius:6px; padding:16px; margin-bottom:14px; }}
+h1 {{ margin:0 0 16px; font-size:22px; }}
+label {{ display:block; margin-bottom:6px; color:#51606b; font-size:13px; }}
+input {{ box-sizing:border-box; width:100%; padding:9px; border:1px solid #bcc7ce; border-radius:4px; font-size:14px; }}
+.row {{ display:grid; grid-template-columns: 1fr 1fr auto; gap:10px; align-items:end; }}
+button, a.button {{ border:0; border-radius:4px; background:#1f6f78; color:white; padding:9px 15px; cursor:pointer; font-weight:700; text-decoration:none; }}
+a.button {{ display:inline-block; background:#6b7780; }}
+table {{ width:100%; border-collapse:collapse; font-size:13px; }}
+th, td {{ border-bottom:1px solid #e1e5e8; padding:8px; text-align:left; }}
+th {{ background:#edf1f3; color:#44515a; }}
+.actions {{ display:flex; gap:10px; margin-bottom:14px; }}
+</style>
+</head>
+<body>
+<main>
+  <div class="actions"><a class="button" href="/">返回首页</a></div>
+  <section class="panel">
+    <h1>用户管理</h1>
+    <form method="post" action="/users">
+      <div class="row">
+        <div><label>用户名</label><input name="username" required></div>
+        <div><label>密码</label><input name="password" type="password" required></div>
+        <button type="submit">保存用户</button>
+      </div>
+    </form>
+  </section>
+  <section class="panel">
+    <table>
+      <tr><th>用户名</th><th>角色</th><th>创建时间</th><th>更新时间</th></tr>
+      {rows}
+    </table>
+  </section>
+</main>
+</body>
+</html>"""
+
+
 def render_page(config: dict, summary: dict, containers: list[dict], photos: list[dict]) -> str:
     job = summary.get("latest_job") or {}
     job_total = max(1, int(job.get("total") or 1))
@@ -982,6 +1200,7 @@ def render_page(config: dict, summary: dict, containers: list[dict], photos: lis
     login_status = html.escape(config.get("login_status") or "未登录")
     login_checked_at = html.escape(config.get("login_checked_at") or "")
     otp_checked = "checked" if str(config.get("otp_enabled") or "0").lower() in {"1", "true", "yes", "on"} else ""
+    user = html.escape(current_user_name())
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1070,8 +1289,11 @@ setInterval(() => {{
   <div class="header-inner">
     <h1>DAS 集装箱照片下载</h1>
     <div class="actions">
+      <span>当前用户：{user}</span>
       <a class="header-button" href="/labeler" style="color:white;text-decoration:none">照片标注</a>
+      <a class="header-button" href="/users" style="color:white;text-decoration:none">用户</a>
       <button class="header-button" type="button" onclick="openSettings()">设置</button>
+      <form method="post" action="/logout" style="margin:0"><button class="header-button" type="submit">退出</button></form>
     </div>
   </div>
 </header>
