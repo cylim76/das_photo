@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>集装箱照片标注工具</title>
+  <link rel="stylesheet" href="/labeler/assets/styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">CL</div>
+        <div>
+          <h1 id="currentTitle">请选择照片</h1>
+          <p id="progressMeta">未加载进度</p>
+          <p id="currentMeta"></p>
+        </div>
+      </div>
+
+      <section class="filters">
+        <label>年度
+          <select id="yearFilter">
+            <option value="">全部</option>
+          </select>
+        </label>
+        <label>月份
+          <select id="monthFilter">
+            <option value="">全部</option>
+          </select>
+        </label>
+        <label>阶段
+          <select id="stageFilter">
+            <option value="">全部阶段</option>
+            <option value="1">1 进厂检查</option>
+            <option value="2">2 空箱检查</option>
+            <option value="3">3 装箱检查</option>
+            <option value="4">4 封箱检查</option>
+          </select>
+        </label>
+        <label>箱号筛选
+          <input id="searchInput">
+        </label>
+        <label>训练任务
+          <select id="purposeFilter">
+            <option value="">全部任务</option>
+          </select>
+        </label>
+        <label>任务状态
+          <select id="statusFilter">
+            <option value="">全部状态</option>
+            <option value="pending">未处理</option>
+            <option value="annotated">已标注</option>
+            <option value="no_target">无目标</option>
+            <option value="excluded">排除</option>
+          </select>
+        </label>
+
+        <label>复核状态
+
+
+          <select id="reviewFilter">
+
+
+            <option value="">全部复核</option>
+
+
+            <option value="unreviewed">未复核</option>
+
+
+            <option value="reviewed">已复核</option>
+
+
+          </select>
+
+
+        </label>
+
+
+
+        <button id="advancedFilterToggle" class="advanced-filter-toggle" type="button">高级筛选</button>
+
+        <nav class="tabs">
+          <span id="datasetSummary" class="dataset-summary">未扫描</span>
+          <span id="saveStatus" class="save-status">已保存</span>
+          <button class="tab nav-link" id="downloadPageBtn">下载</button>
+          <button class="tab active" data-view="workbench">标注</button>
+          <button class="tab" data-view="settings">设置</button>
+        </nav>
+      </section>
+    </header>
+
+    <main class="main">
+      <section class="view active" id="workbenchView">
+        <section class="current-controls">
+          <div class="field-group purpose-controls">
+            <h3>训练任务</h3>
+            <div class="segmented" id="purposeChecks"></div>
+          </div>
+
+          <div class="field-group status-controls">
+            <h3>任务状态</h3>
+            <div class="segmented" id="statusRadios">
+              <label><input type="radio" name="statusRadio" value="pending">未处理(Z)</label>
+              <label><input type="radio" name="statusRadio" value="annotated">已标注</label>
+              <label><input type="radio" name="statusRadio" value="no_target">无目标(C)</label>
+              <label><input type="radio" name="statusRadio" value="excluded">排除(X)</label>
+            </div>
+          </div>
+
+          <div class="field-group review-controls">
+            <h3>复核状态</h3>
+            <div class="segmented" id="reviewRadios">
+              <label><input type="radio" name="reviewRadio" value="unreviewed">未复核</label>
+              <label><input type="radio" name="reviewRadio" value="reviewed">已复核</label>
+            </div>
+          </div>
+
+          <div class="control-break"></div>
+
+          <div class="field-group class-controls">
+            <h3>标签类型</h3>
+            <div class="segmented" id="classRadios"></div>
+          </div>
+        </section>
+
+        <div class="workspace">
+          <section class="canvas-panel">
+            <div class="canvas-wrap" id="canvasWrap">
+              <img id="photo" alt="">
+              <canvas id="overlay"></canvas>
+              <div class="task-overlay" id="taskOverlay"></div>
+              <button class="photo-nav photo-nav-prev" id="prevBtn" title="上一张">‹</button>
+              <button class="photo-nav photo-nav-next" id="nextBtn" title="下一张">›</button>
+              <div class="empty" id="emptyState">没有选中的照片</div>
+            </div>
+          </section>
+
+          <aside class="detail-panel">
+            <label>识别文本
+              <input id="textInput" placeholder="箱号或铅封号">
+            </label>
+
+            <label>备注
+              <textarea id="notesInput" rows="3"></textarea>
+            </label>
+
+            <div class="annotation-head">
+              <h3>标注框</h3>
+              <button id="clearBoxesBtn">清空框</button>
+            </div>
+            <div id="annotationList" class="annotation-list"></div>
+          </aside>
+        </div>
+
+        <div class="filmstrip-tools" id="filmstripTools">
+          <button id="batchModeBtn" type="button">批量</button>
+          <span id="batchSelectedCount" class="batch-selected-count" hidden>已选 0 张</span>
+          <select id="batchPurposeSelect" hidden></select>
+          <button id="batchPendingBtn" type="button" hidden>未处理</button>
+          <button id="batchNoTargetBtn" type="button" hidden>无目标</button>
+          <button id="batchExcludeBtn" type="button" hidden>排除</button>
+          <button id="batchUnassignBtn" type="button" hidden>未分配</button>
+          <button id="batchClearBtn" type="button" hidden>清空选择</button>
+          <label class="thumb-size-control">缩略图
+            <input id="thumbSizeInput" type="range" min="48" max="180" value="62">
+          </label>
+        </div>
+        <div class="filmstrip-resizer" id="filmstripResizer" title="拖动调整底部照片列表高度">
+          <button class="filmstrip-resizer-handle" id="filmstripToggleBtn" type="button" title="展开/收起照片列表">▴</button>
+        </div>
+        <div class="filmstrip" id="imageList"></div>
+      </section>
+
+      <section class="view" id="settingsView">
+        <header class="toolbar">
+          <div>
+            <h2>设置</h2>
+            <p>照片目录使用 年/月/箱号/阶段 的结构</p>
+          </div>
+        </header>
+        <div class="settings-grid">
+          <section class="label-settings">
+            <div class="config-tabs">
+              <button class="config-tab active" data-config-tab="photos" type="button">照片目录</button>
+              <button class="config-tab" data-config-tab="labels" type="button">标签类型</button>
+              <button class="config-tab" data-config-tab="tasks" type="button">训练任务</button>
+            </div>
+
+            <div class="config-panel active" id="photosConfigPanel">
+              <div class="settings-section-head">
+                <h3>照片目录</h3>
+              </div>
+              <label>照片根目录
+                <input id="photoRootInput" value="D:/RPA/photos">
+              </label>
+              <div class="settings-actions">
+                <button id="saveConfigBtn">保存设置</button>
+                <button id="scanBtn" class="primary">扫描并生成索引</button>
+              </div>
+            </div>
+
+            <div class="config-panel" id="labelsConfigPanel">
+              <div class="settings-section-head">
+                <h3>标签列表</h3>
+                <button id="addLabelBtn" type="button">新增标签</button>
+              </div>
+              <div class="config-editor">
+                <div id="labelSettingsList" class="settings-list label-picker"></div>
+                <div id="labelDetailPanel" class="settings-detail"></div>
+              </div>
+            </div>
+
+            <div class="config-panel" id="tasksConfigPanel">
+              <div class="settings-section-head">
+                <h3>训练任务</h3>
+                <button id="addTaskBtn" type="button">新增任务</button>
+              </div>
+              <div id="taskSettingsList" class="settings-list"></div>
+            </div>
+          </section>
+          <div class="settings-actions" id="labelConfigActions" hidden>
+            <button id="saveLabelConfigBtn" class="primary">保存训练任务和标签</button>
+          </div>
+          <pre id="settingsLog"></pre>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="toast-host" id="toastHost" aria-live="polite"></div>
+  <div class="confirm-overlay" id="confirmOverlay" hidden>
+    <section class="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+      <h2 id="confirmTitle">确认操作</h2>
+      <div class="confirm-body" id="confirmBody"></div>
+      <div class="confirm-actions">
+        <button id="confirmCancelBtn" type="button">取消</button>
+        <button id="confirmOkBtn" class="primary" type="button">确认</button>
+      </div>
+    </section>
+  </div>
+
+  <script src="/labeler/assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,1280 @@
+from __future__ import annotations
+
+import argparse
+import hashlib
+import html
+import mimetypes
+import os
+import re
+import shutil
+import signal
+import sqlite3
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+from flask import Flask, Response, jsonify, redirect, request, send_file, url_for
+
+from labeler import server as labeler_server
+
+
+TOOLS_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = TOOLS_DIR.parent
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+DEFAULT_DATA_DIR = TOOLS_DIR / "data"
+DEFAULT_PHOTO_DIR = Path(os.environ.get("DAS_PHOTO_ROOT", str(TOOLS_DIR.parent / "photos")))
+LABELER_PUBLIC_DIR = TOOLS_DIR / "labeler" / "public"
+DEFAULT_BASE_URL = "http://das.china.lge.com:7005"
+DETAIL_PATH = "/Manage/cpm/V_CPM_DETAIL.aspx?cpm_id={cpm_id}"
+DAS_LOGIN_SSO_URL = "http://das.china.lge.com:7005/LoginSSO.aspx"
+
+
+def is_foreign_windows_path(value: str) -> bool:
+    return os.name != "nt" and bool(re.match(r"^[A-Za-z]:[\\/]", str(value or "")))
+
+
+def resolve_photo_dir(value: str | None = None) -> Path:
+    text = str(value or "").strip()
+    if not text or is_foreign_windows_path(text):
+        return DEFAULT_PHOTO_DIR
+    return Path(text).expanduser()
+
+
+STEP_INFO = {
+    "U1": (1, "进厂检查"),
+    "U2": (2, "空箱检查"),
+    "U3": (3, "装箱检查"),
+    "S1": (4, "封箱检查"),
+}
+
+
+FIELD_IDS = {
+    "lbCpmId": "cpm_id_text",
+    "lbCntrNo": "container_no",
+    "lbBeginDate": "begin_date",
+    "lbEndDate": "end_date",
+    "lbProductType": "product_type",
+    "lbPackingType": "packing_type",
+    "lbUseTime": "use_time",
+    "lbRemark": "remark",
+    "lbStatus": "status_text",
+    "lbSealNo": "seal_no",
+    "lbCreatedBy": "created_by",
+    "lbFileCount": "file_count_text",
+}
+
+
+def now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def sanitize_path_part(value: str, fallback: str) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", text)
+    text = re.sub(r"\s+", "_", text).strip("._ ")
+    return text or fallback
+
+
+def strip_tags(value: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", value or "")
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def span_value(page: str, span_id: str) -> str:
+    pattern = rf'<span\b[^>]*\bid=["\']{re.escape(span_id)}["\'][^>]*>(.*?)</span>'
+    match = re.search(pattern, page, flags=re.I | re.S)
+    return strip_tags(match.group(1)) if match else ""
+
+
+def absolute_url(base_url: str, value: str) -> str:
+    value = html.unescape(str(value or "").strip())
+    return urllib.parse.urljoin(base_url.rstrip("/") + "/", value)
+
+
+def detect_year_month(begin_date: str, end_date: str) -> tuple[str, str]:
+    text = (begin_date or end_date or "").strip()
+    match = re.search(r"(\d{4})[-/](\d{1,2})", text)
+    if match:
+        return match.group(1), match.group(2).zfill(2)
+    return "unknown_year", "unknown_month"
+
+
+@dataclass
+class ParsedPhoto:
+    step_code: str
+    step_no: int
+    step_name: str
+    label: str
+    source_url: str
+    thumb_url: str
+
+
+@dataclass
+class ParsedContainer:
+    cpm_id: int
+    container_no: str
+    begin_date: str
+    end_date: str
+    product_type: str
+    packing_type: str
+    use_time: str
+    remark: str
+    status_text: str
+    seal_no: str
+    created_by: str
+    file_count: int
+    photos: list[ParsedPhoto]
+
+
+def parse_detail_page(cpm_id: int, page: str, base_url: str) -> ParsedContainer | None:
+    fields = {target: span_value(page, source) for source, target in FIELD_IDS.items()}
+    if not fields.get("container_no") and "V_CPM_DETAIL" not in page and "集装箱" not in page:
+        return None
+
+    photos: list[ParsedPhoto] = []
+    for step_code, (step_no, default_name) in STEP_INFO.items():
+        block_match = re.search(
+            rf'<tr\b[^>]*\bid=["\']TR_STEP_{step_code}["\'][^>]*>(.*?)</tr>',
+            page,
+            flags=re.I | re.S,
+        )
+        if not block_match:
+            for row_match in re.finditer(r"<tr\b[^>]*>(.*?)</tr>", page, flags=re.I | re.S):
+                row = row_match.group(1)
+                if re.search(rf">\s*{step_no}\.", row) and f"lbConfirm{step_code}UseTime" in row:
+                    block_match = row_match
+                    break
+        if not block_match:
+            continue
+        block = block_match.group(1)
+        name_match = re.search(r"<span\b[^>]*>(\s*\d+\.[^<]+)</span>", block, flags=re.I | re.S)
+        step_name = strip_tags(name_match.group(1)).split(".", 1)[-1] if name_match else default_name
+        for anchor in re.finditer(
+            r"<a\b[^>]*href=['\"](?P<href>[^'\"]+)['\"][^>]*>(?P<body>.*?)</a>",
+            block,
+            flags=re.I | re.S,
+        ):
+            href = anchor.group("href")
+            if not re.search(r"\.(?:jpg|jpeg|png|bmp|gif)(?:$|\?)", href, flags=re.I):
+                continue
+            body = anchor.group("body")
+            thumb_match = re.search(r"<(?:img|image)\b[^>]*src=['\"]([^'\"]+)['\"]", body, flags=re.I | re.S)
+            label_text = strip_tags(re.sub(r"<(?:img|image)\b[^>]*>", " ", body, flags=re.I | re.S))
+            label_match = re.search(r"\bF\d+\b", label_text)
+            label = label_match.group(0) if label_match else f"{step_code}_{len(photos) + 1:04d}"
+            photos.append(
+                ParsedPhoto(
+                    step_code=step_code,
+                    step_no=step_no,
+                    step_name=step_name or default_name,
+                    label=label,
+                    source_url=absolute_url(base_url, href),
+                    thumb_url=absolute_url(base_url, thumb_match.group(1)) if thumb_match else "",
+                )
+            )
+
+    try:
+        file_count = int(re.sub(r"\D+", "", fields.get("file_count_text") or "0") or "0")
+    except ValueError:
+        file_count = 0
+
+    return ParsedContainer(
+        cpm_id=cpm_id,
+        container_no=fields.get("container_no") or f"CPM_{cpm_id}",
+        begin_date=fields.get("begin_date") or "",
+        end_date=fields.get("end_date") or "",
+        product_type=fields.get("product_type") or "",
+        packing_type=fields.get("packing_type") or "",
+        use_time=fields.get("use_time") or "",
+        remark=fields.get("remark") or "",
+        status_text=fields.get("status_text") or "",
+        seal_no=fields.get("seal_no") or "",
+        created_by=fields.get("created_by") or "",
+        file_count=file_count,
+        photos=photos,
+    )
+
+
+class Store:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self.init_db()
+
+    def connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def init_db(self) -> None:
+        with self.connect() as conn:
+            conn.executescript(
+                """
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS containers (
+                    cpm_id INTEGER PRIMARY KEY,
+                    container_no TEXT NOT NULL DEFAULT '',
+                    seal_no TEXT NOT NULL DEFAULT '',
+                    begin_date TEXT NOT NULL DEFAULT '',
+                    end_date TEXT NOT NULL DEFAULT '',
+                    product_type TEXT NOT NULL DEFAULT '',
+                    packing_type TEXT NOT NULL DEFAULT '',
+                    use_time TEXT NOT NULL DEFAULT '',
+                    remark TEXT NOT NULL DEFAULT '',
+                    status_text TEXT NOT NULL DEFAULT '',
+                    created_by TEXT NOT NULL DEFAULT '',
+                    file_count INTEGER NOT NULL DEFAULT 0,
+                    photo_count INTEGER NOT NULL DEFAULT 0,
+                    download_status TEXT NOT NULL DEFAULT '',
+                    message TEXT NOT NULL DEFAULT '',
+                    scanned_at TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS photos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cpm_id INTEGER NOT NULL,
+                    step_code TEXT NOT NULL DEFAULT '',
+                    step_no INTEGER NOT NULL DEFAULT 0,
+                    step_name TEXT NOT NULL DEFAULT '',
+                    photo_label TEXT NOT NULL DEFAULT '',
+                    source_url TEXT NOT NULL,
+                    thumb_url TEXT NOT NULL DEFAULT '',
+                    local_path TEXT NOT NULL DEFAULT '',
+                    file_size INTEGER NOT NULL DEFAULT 0,
+                    sha256 TEXT NOT NULL DEFAULT '',
+                    downloaded_at TEXT NOT NULL DEFAULT '',
+                    UNIQUE(cpm_id, source_url)
+                );
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    start_id INTEGER NOT NULL,
+                    end_id INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    total INTEGER NOT NULL DEFAULT 0,
+                    processed INTEGER NOT NULL DEFAULT 0,
+                    found_containers INTEGER NOT NULL DEFAULT 0,
+                    photos_downloaded INTEGER NOT NULL DEFAULT 0,
+                    skipped_empty INTEGER NOT NULL DEFAULT 0,
+                    failed INTEGER NOT NULL DEFAULT 0,
+                    current_id INTEGER,
+                    max_completed_id INTEGER,
+                    message TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT
+                );
+                """
+            )
+            defaults = {
+                "base_url": DEFAULT_BASE_URL,
+                "output_dir": str(DEFAULT_PHOTO_DIR),
+                "cookie": os.environ.get("DAS_COOKIE", ""),
+                "browser": "edge",
+                "sso_login_id": "",
+                "sso_password": "",
+                "employee_no": "",
+                "personal_id_code": "",
+                "login_otp": "",
+                "otp_enabled": "0",
+                "login_status": "未登录",
+                "login_checked_at": "",
+                "page_fetch_mode": "browser",
+                "delay_seconds": "0.3",
+                "timeout_seconds": "30",
+            }
+            for key, value in defaults.items():
+                conn.execute("INSERT OR IGNORE INTO config(key, value) VALUES(?, ?)", (key, value))
+
+    def get_config(self) -> dict[str, str]:
+        with self.connect() as conn:
+            config = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM config")}
+        config["output_dir"] = str(resolve_photo_dir(config.get("output_dir")))
+        return config
+
+    def save_config(self, values: dict[str, str]) -> None:
+        allowed = {
+            "base_url",
+            "output_dir",
+            "cookie",
+            "browser",
+            "sso_login_id",
+            "sso_password",
+            "employee_no",
+            "personal_id_code",
+            "login_otp",
+            "otp_enabled",
+            "login_status",
+            "login_checked_at",
+            "page_fetch_mode",
+            "delay_seconds",
+            "timeout_seconds",
+        }
+        with self.connect() as conn:
+            for key, value in values.items():
+                if key in allowed:
+                    conn.execute(
+                        "INSERT INTO config(key, value) VALUES(?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (key, str(value or "").strip()),
+                    )
+
+    def create_job(self, start_id: int, end_id: int) -> int:
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO jobs(start_id, end_id, status, total, created_at, message)
+                VALUES(?, ?, 'queued', ?, ?, '')
+                """,
+                (start_id, end_id, end_id - start_id + 1, now_text()),
+            )
+            return int(cur.lastrowid)
+
+    def update_job(self, job_id: int, **values) -> None:
+        if not values:
+            return
+        assignments = ", ".join(f"{key}=?" for key in values)
+        params = list(values.values()) + [job_id]
+        with self.connect() as conn:
+            conn.execute(f"UPDATE jobs SET {assignments} WHERE id=?", params)
+
+    def mark_latest_running_job_stopping(self) -> None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM jobs WHERE status='running' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if row:
+                conn.execute(
+                    "UPDATE jobs SET status='stopping', message=? WHERE id=?",
+                    ("已请求停止，当前 ID 完成后停止", row["id"]),
+                )
+
+    def existing_containers_in_range(self, start_id: int, end_id: int) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT cpm_id, container_no, begin_date, photo_count, download_status
+                FROM containers
+                WHERE cpm_id BETWEEN ? AND ?
+                ORDER BY cpm_id
+                """,
+                (start_id, end_id),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def purge_range(self, start_id: int, end_id: int, output_dir: Path) -> int:
+        output_root = output_dir.resolve()
+        removed_dirs: set[Path] = set()
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT local_path FROM photos WHERE cpm_id BETWEEN ? AND ? AND local_path <> ''",
+                (start_id, end_id),
+            ).fetchall()
+            for row in rows:
+                path = Path(row["local_path"])
+                if len(path.parents) < 2:
+                    continue
+                container_dir = path.parent.parent
+                try:
+                    resolved_dir = container_dir.resolve()
+                    resolved_dir.relative_to(output_root)
+                except Exception:
+                    continue
+                removed_dirs.add(resolved_dir)
+
+            for directory in sorted(removed_dirs, key=lambda item: len(str(item)), reverse=True):
+                if directory.exists() and directory.is_dir():
+                    shutil.rmtree(directory)
+
+            conn.execute("DELETE FROM photos WHERE cpm_id BETWEEN ? AND ?", (start_id, end_id))
+            conn.execute("DELETE FROM containers WHERE cpm_id BETWEEN ? AND ?", (start_id, end_id))
+        return len(removed_dirs)
+
+    def upsert_container(self, item: ParsedContainer, status: str, message: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO containers(
+                    cpm_id, container_no, seal_no, begin_date, end_date, product_type,
+                    packing_type, use_time, remark, status_text, created_by, file_count,
+                    photo_count, download_status, message, scanned_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cpm_id) DO UPDATE SET
+                    container_no=excluded.container_no,
+                    seal_no=excluded.seal_no,
+                    begin_date=excluded.begin_date,
+                    end_date=excluded.end_date,
+                    product_type=excluded.product_type,
+                    packing_type=excluded.packing_type,
+                    use_time=excluded.use_time,
+                    remark=excluded.remark,
+                    status_text=excluded.status_text,
+                    created_by=excluded.created_by,
+                    file_count=excluded.file_count,
+                    photo_count=excluded.photo_count,
+                    download_status=excluded.download_status,
+                    message=excluded.message,
+                    scanned_at=excluded.scanned_at
+                """,
+                (
+                    item.cpm_id,
+                    item.container_no,
+                    item.seal_no,
+                    item.begin_date,
+                    item.end_date,
+                    item.product_type,
+                    item.packing_type,
+                    item.use_time,
+                    item.remark,
+                    item.status_text,
+                    item.created_by,
+                    item.file_count,
+                    len(item.photos),
+                    status,
+                    message,
+                    now_text(),
+                ),
+            )
+
+    def upsert_photo(self, item: ParsedPhoto, cpm_id: int, local_path: Path, file_size: int, digest: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO photos(
+                    cpm_id, step_code, step_no, step_name, photo_label, source_url,
+                    thumb_url, local_path, file_size, sha256, downloaded_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cpm_id, source_url) DO UPDATE SET
+                    step_code=excluded.step_code,
+                    step_no=excluded.step_no,
+                    step_name=excluded.step_name,
+                    photo_label=excluded.photo_label,
+                    thumb_url=excluded.thumb_url,
+                    local_path=excluded.local_path,
+                    file_size=excluded.file_size,
+                    sha256=excluded.sha256,
+                    downloaded_at=excluded.downloaded_at
+                """,
+                (
+                    cpm_id,
+                    item.step_code,
+                    item.step_no,
+                    item.step_name,
+                    item.label,
+                    item.source_url,
+                    item.thumb_url,
+                    str(local_path),
+                    file_size,
+                    digest,
+                    now_text(),
+                ),
+            )
+
+    def mark_no_record(self, cpm_id: int, status: str, message: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO containers(cpm_id, download_status, message, scanned_at)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(cpm_id) DO UPDATE SET
+                    download_status=excluded.download_status,
+                    message=excluded.message,
+                    scanned_at=excluded.scanned_at
+                """,
+                (cpm_id, status, message, now_text()),
+            )
+
+    def summary(self) -> dict:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS containers,
+                    COALESCE(SUM(photo_count), 0) AS photo_rows,
+                    MAX(CASE WHEN download_status IN ('downloaded','empty','no_record') THEN cpm_id END) AS max_done,
+                    MAX(CASE WHEN photo_count > 0 THEN cpm_id END) AS max_with_photos
+                FROM containers
+                """
+            ).fetchone()
+            photos = conn.execute("SELECT COUNT(*) AS cnt FROM photos").fetchone()["cnt"]
+            job = conn.execute("SELECT * FROM jobs ORDER BY id DESC LIMIT 1").fetchone()
+            return {
+                "containers": row["containers"],
+                "photo_rows": row["photo_rows"],
+                "photo_files": photos,
+                "max_completed_id": row["max_done"],
+                "max_with_photos_id": row["max_with_photos"],
+                "latest_job": dict(job) if job else None,
+            }
+
+    def recent_containers(self, limit: int = 30) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM containers ORDER BY cpm_id DESC LIMIT ?",
+                (max(1, min(500, int(limit or 30))),),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def recent_photos(self, limit: int = 24) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT p.*, c.container_no, c.begin_date
+                FROM photos p
+                LEFT JOIN containers c ON c.cpm_id = p.cpm_id
+                ORDER BY p.id DESC
+                LIMIT ?
+                """,
+                (max(1, min(200, int(limit or 24))),),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def photo_path(self, photo_id: int) -> Path | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT local_path FROM photos WHERE id=?", (photo_id,)).fetchone()
+            return Path(row["local_path"]) if row and row["local_path"] else None
+
+
+class Downloader:
+    def __init__(self, store: Store):
+        self.store = store
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+
+    def start(self, start_id: int, end_id: int, *, overwrite: bool = False) -> int:
+        if start_id < 0 or end_id < start_id:
+            raise ValueError("ID 范围不正确")
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                raise RuntimeError("已有下载任务正在运行")
+            self._stop.clear()
+            job_id = self.store.create_job(start_id, end_id)
+            self._thread = threading.Thread(
+                target=self._run_job,
+                args=(job_id, start_id, end_id, overwrite),
+                daemon=True,
+            )
+            self._thread.start()
+            return job_id
+
+    def cancel(self) -> None:
+        self._stop.set()
+
+    def _headers(self, config: dict[str, str], referer: str = "") -> dict[str, str]:
+        headers = {
+            "User-Agent": "Mozilla/5.0 DAS-CPM-Photo-Downloader/1.0",
+            "Accept": "text/html,image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        }
+        cookie = (config.get("cookie") or "").strip()
+        if cookie:
+            headers["Cookie"] = cookie
+        if referer:
+            headers["Referer"] = referer
+        return headers
+
+    def _fetch_bytes(self, url: str, config: dict[str, str], referer: str = "") -> tuple[bytes, str]:
+        timeout = float(config.get("timeout_seconds") or 30)
+        req = urllib.request.Request(url, headers=self._headers(config, referer))
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read(), resp.headers.get("Content-Type", "")
+
+    def _fetch_text(self, url: str, config: dict[str, str]) -> str:
+        body, content_type = self._fetch_bytes(url, config)
+        encoding = "utf-8"
+        match = re.search(r"charset=([\w-]+)", content_type or "", flags=re.I)
+        if match:
+            encoding = match.group(1)
+        return body.decode(encoding, errors="replace")
+
+    def _open_das_session(self, config: dict[str, str]) -> None:
+        runtime_inputs = {
+            "browser": (config.get("browser") or "edge").strip().lower(),
+            "login_username": config.get("sso_login_id") or "",
+            "login_password": config.get("sso_password") or "",
+            "employee_no": config.get("employee_no") or "",
+            "personal_id_code": config.get("personal_id_code") or "",
+            "login_otp": config.get("login_otp") or "",
+            "otp_enabled": str(config.get("otp_enabled") or "0").lower() in {"1", "true", "yes", "on"},
+            "close_existing_browser": False,
+            "sso_autologin_enabled": True,
+        }
+        from actions.browser import activate_browser_window
+        from actions.pyautogui_safety import disable_pyautogui_failsafe
+        from actions.wait import wait
+        from actions.sso_session import ensure_sso_session
+        import pyautogui
+        import pyperclip
+
+        disable_pyautogui_failsafe("das_cpm_photo_downloader_download")
+        ensure_sso_session(runtime_inputs)
+        activate_browser_window(runtime_inputs["browser"])
+        pyperclip.copy(DAS_LOGIN_SSO_URL)
+        pyautogui.hotkey("ctrl", "l")
+        wait(0.1)
+        pyautogui.hotkey("ctrl", "v")
+        pyautogui.press("enter")
+        wait(1)
+        self.store.save_config({"login_status": "下载前已确认 DAS 登录", "login_checked_at": now_text()})
+
+    def _fetch_text_with_browser(self, url: str, config: dict[str, str]) -> str:
+        browser = (config.get("browser") or "edge").strip().lower()
+        timeout = float(config.get("timeout_seconds") or 30)
+        from actions.browser import activate_browser_window
+        from actions.wait import wait
+        import pyautogui
+        import pyperclip
+
+        if not activate_browser_window(browser):
+            raise RuntimeError("浏览器窗口未打开，请先执行 SSO/DAS 登录")
+        pyperclip.copy(url)
+        pyautogui.hotkey("ctrl", "l")
+        wait(0.05)
+        pyautogui.hotkey("ctrl", "v")
+        pyautogui.press("enter")
+        wait(min(max(timeout / 5, 2), 8))
+        pyautogui.hotkey("ctrl", "u")
+        wait(0.8)
+        pyautogui.hotkey("ctrl", "a")
+        wait(0.05)
+        pyautogui.hotkey("ctrl", "c")
+        wait(0.2)
+        page = str(pyperclip.paste() or "")
+        pyautogui.hotkey("ctrl", "w")
+        wait(0.2)
+        if not page.strip():
+            raise RuntimeError("没有从浏览器复制到页面源码")
+        return page
+
+    def _download_photo(self, parsed: ParsedContainer, photo: ParsedPhoto, config: dict[str, str], detail_url: str) -> Path:
+        output_dir = resolve_photo_dir(config.get("output_dir"))
+        year, month = detect_year_month(parsed.begin_date, parsed.end_date)
+        container = sanitize_path_part(parsed.container_no, f"CPM_{parsed.cpm_id}")
+        step_dir = sanitize_path_part(str(photo.step_no), str(photo.step_no))
+        target_dir = output_dir / year / month / container / step_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        parsed_url = urllib.parse.urlparse(photo.source_url)
+        suffix = Path(urllib.parse.unquote(parsed_url.path)).suffix.lower()
+        if suffix not in {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}:
+            suffix = ".jpg"
+        filename = sanitize_path_part(photo.label, f"{photo.step_code}_{int(time.time() * 1000)}") + suffix
+        target = target_dir / filename
+        if target.exists() and target.stat().st_size > 0:
+            data = target.read_bytes()
+        else:
+            data, _content_type = self._fetch_bytes(photo.source_url, config, referer=detail_url)
+            target.write_bytes(data)
+        digest = hashlib.sha256(data).hexdigest()
+        self.store.upsert_photo(photo, parsed.cpm_id, target, len(data), digest)
+        return target
+
+    def _run_job(self, job_id: int, start_id: int, end_id: int, overwrite: bool = False) -> None:
+        self.store.update_job(job_id, status="running", started_at=now_text(), message="开始下载")
+        counters = {"processed": 0, "found": 0, "photos": 0, "empty": 0, "failed": 0}
+        try:
+            initial_config = self.store.get_config()
+            if overwrite:
+                self.store.update_job(job_id, message="正在删除重复 ID 的旧照片")
+                output_dir = resolve_photo_dir(initial_config.get("output_dir"))
+                removed = self.store.purge_range(start_id, end_id, output_dir)
+                self.store.update_job(job_id, message=f"已删除旧照片目录 {removed} 个")
+            use_browser = (initial_config.get("page_fetch_mode") or "browser").strip().lower() == "browser"
+            if use_browser:
+                self.store.update_job(job_id, message="正在确认 SSO/DAS 登录")
+                self._open_das_session(initial_config)
+            for cpm_id in range(start_id, end_id + 1):
+                if self._stop.is_set():
+                    self.store.update_job(job_id, status="cancelled", finished_at=now_text(), message="已在当前 ID 完成后停止")
+                    return
+                config = self.store.get_config()
+                base_url = (config.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
+                detail_url = base_url + DETAIL_PATH.format(cpm_id=cpm_id)
+                self.store.update_job(job_id, current_id=cpm_id, message=f"正在处理 {cpm_id}")
+                try:
+                    if (config.get("page_fetch_mode") or "browser").strip().lower() == "browser":
+                        page = self._fetch_text_with_browser(detail_url, config)
+                    else:
+                        page = self._fetch_text(detail_url, config)
+                    if re.search(r"Login|SSO|登录", page, flags=re.I) and not re.search(r"lbCntrNo|TR_STEP_", page):
+                        raise RuntimeError("页面像是登录页，请在设置里填写有效 Cookie")
+                    parsed = parse_detail_page(cpm_id, page, base_url)
+                    if parsed is None or not parsed.container_no:
+                        counters["empty"] += 1
+                        self.store.mark_no_record(cpm_id, "no_record", "没有记录或页面为空")
+                    elif not parsed.photos:
+                        counters["found"] += 1
+                        counters["empty"] += 1
+                        self.store.upsert_container(parsed, "empty", "有箱号但没有照片")
+                    else:
+                        counters["found"] += 1
+                        downloaded = 0
+                        for photo in parsed.photos:
+                            self._download_photo(parsed, photo, config, detail_url)
+                            downloaded += 1
+                        counters["photos"] += downloaded
+                        self.store.upsert_container(parsed, "downloaded", f"下载照片 {downloaded} 张")
+                except (urllib.error.URLError, TimeoutError, RuntimeError, OSError) as exc:
+                    counters["failed"] += 1
+                    self.store.mark_no_record(cpm_id, "failed", str(exc)[:500])
+
+                counters["processed"] += 1
+                self.store.update_job(
+                    job_id,
+                    processed=counters["processed"],
+                    found_containers=counters["found"],
+                    photos_downloaded=counters["photos"],
+                    skipped_empty=counters["empty"],
+                    failed=counters["failed"],
+                    max_completed_id=cpm_id,
+                )
+                delay = float(config.get("delay_seconds") or 0)
+                if delay > 0:
+                    time.sleep(delay)
+
+            self.store.update_job(job_id, status="finished", finished_at=now_text(), message="完成")
+        except Exception as exc:
+            self.store.update_job(job_id, status="failed", finished_at=now_text(), message=str(exc)[:500])
+
+
+class SsoLoginRunner:
+    def __init__(self, store: Store):
+        self.store = store
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                raise RuntimeError("SSO 登录正在执行")
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+    def _run(self) -> None:
+        config = self.store.get_config()
+        runtime_inputs = {
+            "browser": (config.get("browser") or "edge").strip().lower(),
+            "login_username": config.get("sso_login_id") or "",
+            "login_password": config.get("sso_password") or "",
+            "employee_no": config.get("employee_no") or "",
+            "personal_id_code": config.get("personal_id_code") or "",
+            "login_otp": config.get("login_otp") or "",
+            "otp_enabled": str(config.get("otp_enabled") or "0").lower() in {"1", "true", "yes", "on"},
+            "close_existing_browser": False,
+            "sso_autologin_enabled": True,
+            "sso_session_force_login": True,
+        }
+        try:
+            self.store.save_config({"login_status": "正在登录", "login_checked_at": now_text()})
+            from actions.browser import activate_browser_window
+            from actions.pyautogui_safety import disable_pyautogui_failsafe
+            from actions.wait import wait
+            from actions.sso_session import ensure_sso_session
+            import pyautogui
+            import pyperclip
+
+            disable_pyautogui_failsafe("das_cpm_photo_downloader")
+            ensure_sso_session(runtime_inputs, force_login=True)
+            activate_browser_window(runtime_inputs["browser"])
+            pyperclip.copy(DAS_LOGIN_SSO_URL)
+            pyautogui.hotkey("ctrl", "l")
+            wait(0.1)
+            pyautogui.hotkey("ctrl", "v")
+            pyautogui.press("enter")
+            wait(2)
+            self.store.save_config({"login_status": "已打开 DAS 登录入口", "login_checked_at": now_text()})
+        except Exception as exc:
+            self.store.save_config({"login_status": f"登录失败: {exc}", "login_checked_at": now_text()})
+
+
+def create_app(db_path: Path) -> Flask:
+    store = Store(db_path)
+    downloader = Downloader(store)
+    app = Flask(__name__)
+
+    @app.get("/")
+    def index():
+        config = store.get_config()
+        summary = store.summary()
+        containers = store.recent_containers(40)
+        photos = store.recent_photos(12)
+        return Response(render_page(config, summary, containers, photos), mimetype="text/html; charset=utf-8")
+
+    def sync_labeler_photo_root() -> dict:
+        labeler_config = labeler_server.get_config()
+        output_dir = (store.get_config().get("output_dir") or "").strip()
+        normalized_output_dir = labeler_server.normalize_root(output_dir) if output_dir else ""
+        if normalized_output_dir and labeler_config.get("photo_root") != normalized_output_dir:
+            labeler_config = labeler_server.save_config({"photo_root": normalized_output_dir})
+        return labeler_config
+
+    @app.get("/labeler")
+    def labeler_index():
+        sync_labeler_photo_root()
+        return send_file(LABELER_PUBLIC_DIR / "index.html", mimetype="text/html; charset=utf-8")
+
+    @app.get("/labeler/assets/<path:filename>")
+    def labeler_asset(filename: str):
+        root = LABELER_PUBLIC_DIR.resolve()
+        target = (root / filename).resolve()
+        if not str(target).startswith(str(root)) or not target.exists() or not target.is_file():
+            return Response("not found", status=404)
+        return send_file(target, mimetype=mimetypes.guess_type(target.name)[0] or "application/octet-stream")
+
+    @app.get("/labeler/api/config")
+    def labeler_config():
+        return jsonify(sync_labeler_photo_root())
+
+    @app.post("/labeler/api/config")
+    def labeler_save_config():
+        payload = request.get_json(silent=True) or {}
+        saved = labeler_server.save_config(payload)
+        if payload.get("photo_root"):
+            store.save_config({"output_dir": payload.get("photo_root")})
+        return jsonify(saved)
+
+    @app.get("/labeler/api/label-config")
+    def labeler_label_config():
+        return jsonify(labeler_server.get_label_config())
+
+    @app.post("/labeler/api/label-config")
+    def labeler_save_label_config():
+        return jsonify(labeler_server.save_label_config(request.get_json(silent=True) or {}))
+
+    @app.post("/labeler/api/scan")
+    def labeler_scan():
+        sync_labeler_photo_root()
+        return jsonify(labeler_server.scan_dataset())
+
+    @app.get("/labeler/api/index")
+    def labeler_index_data():
+        sync_labeler_photo_root()
+        return jsonify(labeler_server.load_index())
+
+    @app.get("/labeler/api/images")
+    def labeler_images():
+        sync_labeler_photo_root()
+        params = request.args.to_dict(flat=False)
+        return jsonify({
+            "images": labeler_server.list_images(params),
+            "summary": labeler_server.progress_summary(params),
+            "periods": labeler_server.list_periods(),
+        })
+
+    @app.get("/labeler/api/container")
+    def labeler_container():
+        sync_labeler_photo_root()
+        data, _path = labeler_server.load_container(request.args.get("container_no", ""))
+        return jsonify(data)
+
+    @app.post("/labeler/api/image")
+    def labeler_update_image():
+        sync_labeler_photo_root()
+        return jsonify(labeler_server.update_image(request.get_json(silent=True) or {}))
+
+    @app.post("/labeler/api/images/batch-status")
+    def labeler_batch_status():
+        sync_labeler_photo_root()
+        return jsonify(labeler_server.batch_update_status(request.get_json(silent=True) or {}))
+
+    @app.post("/labeler/api/task-reset")
+    def labeler_task_reset():
+        sync_labeler_photo_root()
+        return jsonify(labeler_server.reset_task_by_filters(request.get_json(silent=True) or {}))
+
+    @app.get("/labeler/media")
+    def labeler_media():
+        sync_labeler_photo_root()
+        rel = request.args.get("path", "")
+        root = Path(labeler_server.get_config()["photo_root"]).resolve()
+        target = (root / rel).resolve()
+        if not str(target).startswith(str(root)) or not target.exists() or not target.is_file():
+            return Response("not found", status=404)
+        return send_file(target, mimetype=mimetypes.guess_type(target.name)[0] or "application/octet-stream")
+
+    @app.post("/config")
+    def save_config():
+        store.save_config(
+            {
+                "base_url": request.form.get("base_url", ""),
+                "output_dir": request.form.get("output_dir", ""),
+                "browser": request.form.get("browser", ""),
+                "sso_login_id": request.form.get("sso_login_id", ""),
+                "sso_password": request.form.get("sso_password", ""),
+                "employee_no": request.form.get("employee_no", ""),
+                "personal_id_code": request.form.get("personal_id_code", ""),
+                "login_otp": request.form.get("login_otp", ""),
+                "otp_enabled": "1" if request.form.get("otp_enabled") else "0",
+                "page_fetch_mode": "browser",
+                "delay_seconds": request.form.get("delay_seconds", ""),
+                "timeout_seconds": request.form.get("timeout_seconds", ""),
+            }
+        )
+        return redirect(url_for("index"))
+
+    @app.post("/jobs")
+    def start_job():
+        start_id = int(request.form.get("start_id") or 2000)
+        count = int(request.form.get("count") or 0)
+        if count <= 0:
+            store.mark_no_record(start_id, "start_failed", "请输入下载数量")
+            return redirect(url_for("index"))
+        end_id = start_id + max(1, count) - 1
+        overwrite = request.form.get("confirm_overwrite") == "1"
+        existing = store.existing_containers_in_range(start_id, end_id)
+        if existing and not overwrite:
+            return Response(
+                render_confirm_overwrite_page(start_id, count, end_id, existing),
+                mimetype="text/html; charset=utf-8",
+            )
+        try:
+            downloader.start(start_id, end_id, overwrite=overwrite)
+        except Exception as exc:
+            store.mark_no_record(start_id, "start_failed", str(exc))
+        return redirect(url_for("index"))
+
+    @app.post("/jobs/cancel")
+    def cancel_job():
+        store.mark_latest_running_job_stopping()
+        downloader.cancel()
+        return redirect(url_for("index"))
+
+    @app.get("/api/status")
+    def api_status():
+        return jsonify(store.summary())
+
+    @app.get("/photo/<int:photo_id>")
+    def photo_file(photo_id: int):
+        path = store.photo_path(photo_id)
+        if not path or not path.exists():
+            return Response("not found", status=404)
+        return send_file(path, mimetype=mimetypes.guess_type(path.name)[0] or "image/jpeg")
+
+    return app
+
+
+def render_page(config: dict, summary: dict, containers: list[dict], photos: list[dict]) -> str:
+    job = summary.get("latest_job") or {}
+    job_total = max(1, int(job.get("total") or 1))
+    job_processed = int(job.get("processed") or 0)
+    progress = min(100, round(job_processed * 100 / job_total, 1))
+    last_done = summary.get("max_completed_id")
+    next_start_id = int(last_done) + 1 if isinstance(last_done, int) else 2000
+    browser = html.escape(config.get("browser") or "edge")
+    sso_login_id = html.escape(config.get("sso_login_id") or "")
+    sso_password = html.escape(config.get("sso_password") or "")
+    employee_no = html.escape(config.get("employee_no") or "")
+    personal_id_code = html.escape(config.get("personal_id_code") or "")
+    login_otp = html.escape(config.get("login_otp") or "")
+    login_status = html.escape(config.get("login_status") or "未登录")
+    login_checked_at = html.escape(config.get("login_checked_at") or "")
+    otp_checked = "checked" if str(config.get("otp_enabled") or "0").lower() in {"1", "true", "yes", "on"} else ""
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DAS 集装箱照片下载</title>
+<style>
+body {{ margin:0; font-family: Arial, "Microsoft YaHei", sans-serif; color:#18242c; background:#f4f6f8; }}
+header {{ background:#184e57; color:white; padding:14px 28px; }}
+.header-inner {{ display:flex; align-items:center; justify-content:space-between; gap:12px; }}
+.header-button {{ background:rgba(255,255,255,0.16); border:1px solid rgba(255,255,255,0.34); padding:8px 13px; }}
+h1 {{ margin:0; font-size:21px; font-weight:700; letter-spacing:0; }}
+h2 {{ margin:0 0 14px; font-size:17px; }}
+main {{ padding:18px 28px 36px; }}
+.grid {{ display:block; }}
+.panel {{ background:white; border:1px solid #d8e0e5; border-radius:6px; padding:15px; margin-bottom:14px; }}
+.stats {{ display:grid; grid-template-columns: repeat(4, minmax(130px, 1fr)); gap:10px; margin-bottom:14px; }}
+.stat {{ background:white; border:1px solid #d8e0e5; border-radius:6px; padding:11px 12px; color:#5a6872; }}
+.stat b {{ display:block; font-size:21px; margin-top:4px; color:#14252d; }}
+label {{ display:block; font-size:13px; color:#51606b; margin-bottom:5px; }}
+input, textarea {{ box-sizing:border-box; width:100%; padding:8px 9px; border:1px solid #bcc7ce; border-radius:4px; font-size:14px; background:white; }}
+input[readonly] {{ background:#eef2f4; color:#51606b; }}
+textarea {{ min-height:72px; font-family: Consolas, monospace; }}
+.row {{ display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; margin-bottom:10px; }}
+.row.two {{ grid-template-columns: repeat(2, 1fr); }}
+button {{ border:0; border-radius:4px; background:#1f6f78; color:white; padding:9px 15px; cursor:pointer; font-weight:700; }}
+button.secondary {{ background:#7b6d50; }}
+select {{ box-sizing:border-box; width:100%; padding:8px 9px; border:1px solid #bfc8d0; border-radius:4px; font-size:14px; background:white; }}
+.checkline {{ display:flex; align-items:center; gap:8px; margin:4px 0 12px; color:#44515a; }}
+.checkline input {{ width:auto; }}
+table {{ width:100%; border-collapse:collapse; font-size:13px; background:white; }}
+th, td {{ border-bottom:1px solid #e1e5e8; padding:8px; text-align:left; white-space:nowrap; }}
+th {{ background:#edf1f3; color:#44515a; }}
+.bar {{ height:10px; background:#d9e2e5; border-radius:4px; overflow:hidden; }}
+.bar span {{ display:block; height:100%; background:#1f6f78; width:{progress}%; }}
+.actions {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }}
+.hint {{ margin-top:8px; color:#697782; font-size:13px; }}
+.modal-backdrop {{ position:fixed; inset:0; background:rgba(10,22,28,0.42); display:none; align-items:center; justify-content:center; padding:18px; z-index:20; }}
+.modal-backdrop.open {{ display:flex; }}
+.modal {{ width:min(860px, 100%); max-height:92vh; overflow:auto; background:white; border-radius:6px; box-shadow:0 18px 50px rgba(0,0,0,0.24); border:1px solid #ccd6dc; }}
+.modal-head {{ display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 16px; border-bottom:1px solid #e1e6e9; }}
+.modal-body {{ padding:16px; }}
+.plain-button {{ background:#6b7780; }}
+.photos {{ display:grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap:10px; }}
+.photo {{ background:white; border:1px solid #d9dee3; border-radius:6px; padding:6px; }}
+.photo img {{ width:100%; height:110px; object-fit:cover; display:block; border-radius:4px; }}
+.muted {{ color:#6b7780; }}
+@media (max-width: 980px) {{ .grid, .row, .stats {{ grid-template-columns: 1fr; }} main {{ padding:14px; }} }}
+</style>
+<script>
+function recalcEndId() {{
+  const start = parseInt(document.getElementById('start_id').value || '2000', 10);
+  const countText = document.getElementById('count').value.trim();
+  if (!countText) {{
+    document.getElementById('end_id').value = '';
+    return;
+  }}
+  const count = parseInt(countText, 10);
+  const end = start + Math.max(1, count) - 1;
+  document.getElementById('end_id').value = Number.isFinite(end) ? end : '';
+}}
+function openSettings() {{
+  document.getElementById('settings-modal').classList.add('open');
+}}
+function closeSettings() {{
+  document.getElementById('settings-modal').classList.remove('open');
+}}
+window.addEventListener('DOMContentLoaded', recalcEndId);
+setInterval(() => {{
+  fetch('/api/status').then(r => r.json()).then(s => {{
+    const j = s.latest_job || {{}};
+    document.getElementById('job-status').textContent = j.status || '无';
+    document.getElementById('job-message').textContent = j.message || '';
+    document.getElementById('job-current').textContent = j.current_id || '';
+    document.getElementById('job-progress-text').textContent = (j.processed || 0) + ' / ' + (j.total || 0);
+    const pct = j.total ? Math.min(100, Math.round((j.processed || 0) * 1000 / j.total) / 10) : 0;
+    document.getElementById('job-bar').style.width = pct + '%';
+    document.getElementById('max-done').textContent = s.max_completed_id || '';
+    document.getElementById('max-photo').textContent = s.max_with_photos_id || '';
+  }}).catch(() => {{}});
+}}, 2500);
+</script>
+</head>
+<body>
+<header>
+  <div class="header-inner">
+    <h1>DAS 集装箱照片下载</h1>
+    <div class="actions">
+      <a class="header-button" href="/labeler" style="color:white;text-decoration:none">照片标注</a>
+      <button class="header-button" type="button" onclick="openSettings()">设置</button>
+    </div>
+  </div>
+</header>
+<main>
+  <section class="stats">
+    <div class="stat">下次开始 ID <b>{next_start_id}</b></div>
+    <div class="stat">上次完成 ID <b id="max-done">{summary.get("max_completed_id") or ""}</b></div>
+    <div class="stat">已保存照片 <b>{summary.get("photo_files") or 0}</b></div>
+    <div class="stat">当前任务 <b id="job-status">{html.escape(str(job.get("status") or "无"))}</b></div>
+  </section>
+  <div class="grid">
+    <section class="panel">
+      <h2>开始下载</h2>
+      <form method="post" action="/jobs">
+        <div class="row">
+          <div><label>开始 cpm_id</label><input id="start_id" name="start_id" value="{next_start_id}" oninput="recalcEndId()"></div>
+          <div><label>数量</label><input id="count" name="count" value="" oninput="recalcEndId()" placeholder="输入要下载的数量"></div>
+          <div><label>结束 cpm_id</label><input id="end_id" name="end_id" value="" readonly></div>
+        </div>
+        <div class="actions">
+          <button type="submit">启动下载</button>
+        </div>
+      </form>
+      <form method="post" action="/jobs/cancel" style="margin-top:10px"><button class="secondary" type="submit">当前 ID 完成后停止</button></form>
+      <p class="muted">进度：<span id="job-progress-text">{job_processed} / {job.get("total") or 0}</span>，当前 ID：<span id="job-current">{job.get("current_id") or ""}</span>，<span id="job-message">{html.escape(str(job.get("message") or ""))}</span></p>
+      <div class="bar"><span id="job-bar"></span></div>
+      <div class="hint">默认从 2000 开始；有完成记录后，会自动带出最后完成 ID 的下一个。</div>
+    </section>
+  </div>
+  <div id="settings-modal" class="modal-backdrop" onclick="if(event.target.id==='settings-modal') closeSettings()">
+    <section class="modal" role="dialog" aria-modal="true" aria-label="设置">
+      <div class="modal-head">
+        <h2>设置</h2>
+        <button class="plain-button" type="button" onclick="closeSettings()">关闭</button>
+      </div>
+      <div class="modal-body">
+        <form method="post" action="/config">
+          <label>DAS 地址</label><input name="base_url" value="{html.escape(config.get("base_url") or DEFAULT_BASE_URL)}">
+          <label>照片保存目录</label><input name="output_dir" value="{html.escape(config.get("output_dir") or str(DEFAULT_PHOTO_DIR))}">
+          <div class="row">
+            <div>
+              <label>浏览器</label>
+              <select name="browser">
+                <option value="edge" {"selected" if browser == "edge" else ""}>Edge</option>
+                <option value="chrome" {"selected" if browser == "chrome" else ""}>Chrome</option>
+              </select>
+            </div>
+            <div><label>SSO 账号</label><input name="sso_login_id" value="{sso_login_id}"></div>
+            <div><label>SSO 密码</label><input name="sso_password" type="password" value="{sso_password}"></div>
+          </div>
+          <div class="row">
+            <div><label>工号</label><input name="employee_no" value="{employee_no}"></div>
+            <div><label>身份码</label><input name="personal_id_code" type="password" value="{personal_id_code}"></div>
+            <div><label>固定 OTP（一般留空）</label><input name="login_otp" value="{login_otp}"></div>
+          </div>
+          <label class="checkline"><input type="checkbox" name="otp_enabled" {otp_checked}> 使用固定 OTP 登录</label>
+          <div class="row">
+            <div><label>每个 ID 间隔秒</label><input name="delay_seconds" value="{html.escape(config.get("delay_seconds") or "0.3")}"></div>
+            <div><label>网页超时秒</label><input name="timeout_seconds" value="{html.escape(config.get("timeout_seconds") or "30")}"></div>
+            <div></div>
+          </div>
+          <div class="actions">
+            <button type="submit">保存设置</button>
+            <button class="plain-button" type="button" onclick="closeSettings()">取消</button>
+          </div>
+        </form>
+      </div>
+    </section>
+  </div>
+  <section class="panel">
+    <h2>最近照片</h2>
+    <div class="photos">
+      {''.join(render_photo_card(p) for p in photos)}
+    </div>
+  </section>
+  <section class="panel">
+    <h2>最近箱子</h2>
+    <table>
+      <tr><th>ID</th><th>日期</th><th>箱号</th><th>铅封号</th><th>照片</th><th>状态</th><th>说明</th></tr>
+      {''.join(render_container_row(c) for c in containers)}
+    </table>
+  </section>
+</main>
+</body>
+</html>"""
+
+
+def render_photo_card(row: dict) -> str:
+    return (
+        '<div class="photo">'
+        f'<img src="/photo/{int(row["id"])}" loading="lazy">'
+        f'<div>{html.escape(row.get("photo_label") or "")}</div>'
+        f'<div class="muted">{row.get("cpm_id")} / {html.escape(row.get("container_no") or "")} / {row.get("step_no")}</div>'
+        "</div>"
+    )
+
+
+def render_confirm_overwrite_page(start_id: int, count: int, end_id: int, existing: list[dict]) -> str:
+    preview = existing[:40]
+    rows = "".join(
+        "<tr>"
+        f"<td>{row.get('cpm_id') or ''}</td>"
+        f"<td>{html.escape(row.get('begin_date') or '')}</td>"
+        f"<td>{html.escape(row.get('container_no') or '')}</td>"
+        f"<td>{row.get('photo_count') or 0}</td>"
+        f"<td>{html.escape(row.get('download_status') or '')}</td>"
+        "</tr>"
+        for row in preview
+    )
+    more = "" if len(existing) <= len(preview) else f"<p>还有 {len(existing) - len(preview)} 个重复 ID 未显示。</p>"
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>确认覆盖下载</title>
+<style>
+body {{ margin:0; font-family: Arial, "Microsoft YaHei", sans-serif; background:#f4f6f8; color:#18242c; }}
+main {{ max-width:920px; margin:0 auto; padding:28px; }}
+.panel {{ background:white; border:1px solid #d8e0e5; border-radius:6px; padding:18px; }}
+h1 {{ margin:0 0 10px; font-size:22px; }}
+p {{ color:#51606b; line-height:1.7; }}
+table {{ width:100%; border-collapse:collapse; font-size:13px; margin:14px 0; }}
+th, td {{ border-bottom:1px solid #e1e5e8; padding:8px; text-align:left; }}
+th {{ background:#edf1f3; color:#44515a; }}
+.actions {{ display:flex; gap:10px; margin-top:14px; }}
+button, a.button {{ border:0; border-radius:4px; padding:9px 15px; font-weight:700; text-decoration:none; cursor:pointer; }}
+button {{ background:#1f6f78; color:white; }}
+a.button {{ background:#6b7780; color:white; }}
+.warn {{ background:#fff7e6; border:1px solid #e8c46d; border-radius:6px; padding:10px 12px; color:#6b4b00; }}
+</style>
+</head>
+<body>
+<main>
+  <section class="panel">
+    <h1>确认覆盖下载</h1>
+    <div class="warn">ID {start_id} 到 {end_id} 中已有 {len(existing)} 个记录。确认后会先删除这些 ID 对应的照片目录和数据库记录，再重新下载。</div>
+    <table>
+      <tr><th>ID</th><th>日期</th><th>箱号</th><th>照片</th><th>状态</th></tr>
+      {rows}
+    </table>
+    {more}
+    <div class="actions">
+      <form method="post" action="/jobs">
+        <input type="hidden" name="start_id" value="{start_id}">
+        <input type="hidden" name="count" value="{count}">
+        <input type="hidden" name="confirm_overwrite" value="1">
+        <button type="submit">确认覆盖并开始</button>
+      </form>
+      <a class="button" href="/">返回</a>
+    </div>
+  </section>
+</main>
+</body>
+</html>"""
+
+
+def render_container_row(row: dict) -> str:
+    return (
+        "<tr>"
+        f"<td>{row.get('cpm_id') or ''}</td>"
+        f"<td>{html.escape(row.get('begin_date') or '')}</td>"
+        f"<td>{html.escape(row.get('container_no') or '')}</td>"
+        f"<td>{html.escape(row.get('seal_no') or '')}</td>"
+        f"<td>{row.get('photo_count') or 0}</td>"
+        f"<td>{html.escape(row.get('download_status') or '')}</td>"
+        f"<td>{html.escape(row.get('message') or '')}</td>"
+        "</tr>"
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="DAS CPM photo downloader web tool.")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8787)
+    parser.add_argument("--db", default=str(DEFAULT_DATA_DIR / "das_cpm_photos.sqlite3"))
+    parser.add_argument("--parse-html", default="", help="Parse a saved DAS detail HTML file and print a summary.")
+    parser.add_argument("--parse-cpm-id", type=int, default=2000)
+    args = parser.parse_args(argv)
+
+    if args.parse_html:
+        page = Path(args.parse_html).read_text(encoding="utf-8", errors="replace")
+        parsed = parse_detail_page(args.parse_cpm_id, page, DEFAULT_BASE_URL)
+        if parsed is None:
+            print("没有识别到集装箱详情。")
+            return 1
+        by_step: dict[int, int] = {}
+        for photo in parsed.photos:
+            by_step[photo.step_no] = by_step.get(photo.step_no, 0) + 1
+        print(f"cpm_id={parsed.cpm_id}")
+        print(f"container_no={parsed.container_no}")
+        print(f"seal_no={parsed.seal_no}")
+        print(f"begin_date={parsed.begin_date}")
+        print(f"photo_count={len(parsed.photos)}")
+        print("steps=" + ", ".join(f"{step}:{count}" for step, count in sorted(by_step.items())))
+        return 0
+
+    app = create_app(Path(args.db))
+    print(f"DAS 集装箱照片下载工具: http://{args.host}:{args.port}")
+    print(f"数据库: {args.db}")
+    app.run(host=args.host, port=args.port, threaded=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
