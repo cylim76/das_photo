@@ -1646,7 +1646,7 @@ function renderAnnotations() {
           <input class="count-field-input" data-field="h" type="number" min="0" step="1" value="${countFields.h || ""}">
         </label>
         <label>F 顶层
-          <input class="count-field-input" data-field="f" type="number" min="0" step="1" value="${countFields.f || ""}">
+          <input class="count-field-input" data-field="f" type="number" min="0" step="1" value="${countFields.f}">
         </label>
         <div class="count-total">总数 <strong>${countFields.total || 0}</strong></div>
       </div>
