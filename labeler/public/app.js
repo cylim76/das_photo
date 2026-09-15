@@ -2,6 +2,7 @@ const state = {
   config: null,
   index: null,
   periods: { years: [] },
+  periodDefaultsApplied: false,
   groups: [],
   summary: null,
   images: [],
@@ -518,7 +519,12 @@ async function loadImages(options = {}) {
     };
   }
   state.periods = data.periods || state.periods;
-  renderPeriodFilters();
+  const periodDefaultsChanged = renderPeriodFilters();
+  if (periodDefaultsChanged) {
+    state.currentIndex = -1;
+    await loadImages(options);
+    return;
+  }
   renderGroupFilters();
   renderProgress();
   renderImageList();
@@ -538,6 +544,8 @@ function renderPeriodFilters() {
   const monthSelect = $("monthFilter");
   const currentYear = yearSelect.value;
   const currentMonth = monthSelect.value;
+  const shouldApplyDefaults = !state.periodDefaultsApplied && !currentYear && !currentMonth && years.length;
+  const latestYear = years[years.length - 1]?.year || "";
 
   yearSelect.innerHTML = '<option value="">全部</option>';
   years.forEach((row) => {
@@ -546,12 +554,15 @@ function renderPeriodFilters() {
     option.textContent = row.year;
     yearSelect.appendChild(option);
   });
-  yearSelect.value = years.some((row) => row.year === currentYear) ? currentYear : "";
+  yearSelect.value = shouldApplyDefaults
+    ? latestYear
+    : years.some((row) => row.year === currentYear) ? currentYear : "";
 
   const selectedYear = yearSelect.value;
   const months = selectedYear
     ? (years.find((row) => row.year === selectedYear)?.months || [])
     : [...new Set(years.flatMap((row) => row.months || []))].sort();
+  const latestMonth = months[months.length - 1] || "";
 
   monthSelect.innerHTML = '<option value="">全部</option>';
   months.forEach((month) => {
@@ -560,7 +571,13 @@ function renderPeriodFilters() {
     option.textContent = month;
     monthSelect.appendChild(option);
   });
-  monthSelect.value = months.includes(currentMonth) ? currentMonth : "";
+  monthSelect.value = shouldApplyDefaults
+    ? latestMonth
+    : months.includes(currentMonth) ? currentMonth : "";
+  if (shouldApplyDefaults) {
+    state.periodDefaultsApplied = true;
+  }
+  return shouldApplyDefaults;
 }
 
 function renderGroupFilters() {
