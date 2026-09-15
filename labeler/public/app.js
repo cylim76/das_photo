@@ -154,6 +154,19 @@ function setView(view) {
   $("settingsView").classList.toggle("active", view === "settings");
 }
 
+function setBrandMenu(open) {
+  const menu = $("brandMenu");
+  const btn = $("brandMenuBtn");
+  if (!menu || !btn) return;
+  menu.hidden = !open;
+  btn.classList.toggle("menu-open", open);
+  btn.setAttribute("aria-expanded", open ? "true" : "false");
+}
+
+function closeBrandMenu() {
+  setBrandMenu(false);
+}
+
 function maxFilmstripHeight() {
   const workbench = $("workbenchView");
   const controls = document.querySelector(".current-controls");
@@ -2065,6 +2078,11 @@ function bindEvents() {
   ensureStatusFilterOptions();
   createAdvancedFilterUi();
   document.querySelectorAll(".tab[data-view]").forEach((btn) => btn.onclick = () => setView(btn.dataset.view));
+  $("brandMenuBtn").onclick = (event) => {
+    event.stopPropagation();
+    setBrandMenu($("brandMenu")?.hidden !== false);
+  };
+  $("brandMenu").onclick = (event) => event.stopPropagation();
   document.querySelectorAll(".config-tab").forEach((btn) => {
     btn.onclick = () => {
       state.labelConfig = collectLabelConfigFromSettings();
@@ -2078,9 +2096,15 @@ function bindEvents() {
     };
   });
   $("downloadPageBtn").onclick = () => {
+    closeBrandMenu();
     window.location.href = "/download";
   };
+  $("settingsMenuBtn").onclick = () => {
+    closeBrandMenu();
+    setView("settings");
+  };
   $("logoutBtn").onclick = async () => {
+    closeBrandMenu();
     await fetch("/logout", { method: "POST" });
     window.location.href = "/login";
   };
@@ -2458,6 +2482,9 @@ function bindEvents() {
 
   document.addEventListener("keydown", (event) => {
     const tag = event.target?.tagName?.toLowerCase();
+    if (event.key === "Escape") {
+      closeBrandMenu();
+    }
     if (event.key === "Escape" && state.batchMode) {
       event.preventDefault();
       exitBatchMode();
@@ -2528,6 +2555,7 @@ function bindEvents() {
       setActivePurpose(taskShortcuts[key], true);
     }
   });
+  document.addEventListener("click", closeBrandMenu);
 }
 
 async function init() {

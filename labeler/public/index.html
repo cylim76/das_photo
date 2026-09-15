@@ -10,7 +10,14 @@
   <div class="app">
     <header class="topbar">
       <div class="brand">
-        <div class="brand-mark">CL</div>
+        <div class="brand-menu-wrap">
+          <button class="brand-mark" id="brandMenuBtn" type="button" aria-haspopup="true" aria-expanded="false">CL</button>
+          <div class="brand-menu" id="brandMenu" hidden>
+            <button type="button" id="downloadPageBtn">下载</button>
+            <button type="button" id="settingsMenuBtn">设置</button>
+            <button type="button" id="logoutBtn">退出</button>
+          </div>
+        </div>
         <div>
           <h1 id="currentTitle">请选择照片</h1>
           <p id="progressMeta">未加载进度</p>
@@ -99,10 +106,7 @@
 
         <nav class="tabs">
           <span id="currentUserMeta" class="dataset-summary"></span>
-          <button class="tab nav-link" id="downloadPageBtn">下载</button>
           <button class="tab active" data-view="workbench">标注</button>
-          <button class="tab" data-view="settings">设置</button>
-          <button class="tab" id="logoutBtn" type="button">退出</button>
         </nav>
       </section>
     </header>
