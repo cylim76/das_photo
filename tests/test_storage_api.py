@@ -107,6 +107,28 @@ class StorageApiIntegrationTest(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             remote.assert_not_called()
 
+    def test_remote_download_page_links_to_remote_labeler(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / "photos.sqlite3"
+            store = Store(database)
+            store.save_config({
+                "storage_mode": "remote",
+                "storage_api_url": "http://p3.internal:8787/",
+                "storage_api_key": "test-key",
+            })
+            app = create_app(database)
+            app.config.update(TESTING=True)
+            client = app.test_client()
+            with client.session_transaction() as session:
+                session["user"] = "admin"
+            users = {"admin": {"name": "admin", "role": "admin"}}
+            remote_summary = ({"latest_job": None}, [], [], "")
+            with patch("downloader.ensure_users", return_value=users):
+                with patch("downloader.Downloader.storage_summary", return_value=remote_summary):
+                    response = client.get("/download")
+            self.assertEqual(response.status_code, 200)
+            self.assertIn(b'href="http://p3.internal:8787/labeler"', response.data)
+
     def test_p3_can_queue_and_control_a_remote_download_job(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             database = Path(temp_dir) / "photos.sqlite3"

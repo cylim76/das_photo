@@ -2234,6 +2234,13 @@ def render_page(
     else:
         storage_mode_label += "；本机执行"
     storage_mode_label = html.escape(storage_mode_label)
+    labeler_url = "/labeler"
+    if is_remote_storage:
+        remote_base_url = str(config.get("storage_api_url") or "").strip().rstrip("/")
+        parsed_remote_url = urllib.parse.urlparse(remote_base_url)
+        if parsed_remote_url.scheme in {"http", "https"} and parsed_remote_url.netloc:
+            labeler_url = remote_base_url + "/labeler"
+    labeler_url = html.escape(labeler_url, quote=True)
     user = html.escape(current_user_name())
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -2379,7 +2386,7 @@ window.addEventListener('DOMContentLoaded', () => {{
     <h1>DAS 集装箱照片下载 <span class="storage-mode-label">（{storage_mode_label}）</span></h1>
     <div class="actions">
       <span>当前用户：{user}</span>
-      <a class="header-button" href="/labeler" style="color:white;text-decoration:none">照片标注</a>
+      <a class="header-button" href="{labeler_url}" style="color:white;text-decoration:none">照片标注</a>
       <a class="header-button" href="/users" style="color:white;text-decoration:none">用户</a>
       <button class="header-button" type="button" onclick="openSettings()">设置</button>
       <form method="post" action="/logout" style="margin:0"><button class="header-button" type="submit">退出</button></form>
