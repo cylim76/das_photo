@@ -56,6 +56,9 @@ python -m pip install -r requirements.txt
 
 启动脚本会优先使用项目内 `.venv\Scripts\python.exe`，没有 `.venv` 时使用系统 `python`。
 
+浏览器 SSO 自动登录模块已经内置在本项目的 `actions`、`workflows` 和 `core` 目录中，
+不再依赖外部 `gerp-import` 项目，也不需要设置额外的模块路径。
+
 ## 数据位置
 
 - 下载器数据库：`data\das_cpm_photos.sqlite3`

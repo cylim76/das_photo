@@ -10,6 +10,13 @@ from downloader import ParsedContainer, ParsedPhoto, RemoteStorageClient, Store,
 
 
 class StorageApiIntegrationTest(unittest.TestCase):
+    def test_bundled_sso_module_is_importable(self):
+        from actions import sso_session
+
+        expected_dir = Path(__file__).resolve().parents[1] / "actions"
+        self.assertEqual(Path(sso_session.__file__).resolve().parent, expected_dir)
+        self.assertTrue(callable(sso_session.ensure_sso_session))
+
     def test_local_download_page_and_api_key_management_page_render(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             database = Path(temp_dir) / "photos.sqlite3"
@@ -23,6 +30,7 @@ class StorageApiIntegrationTest(unittest.TestCase):
                 response = client.get("/download")
                 self.assertEqual(response.status_code, 200)
                 self.assertIn("远程 API 模式".encode("utf-8"), response.data)
+                self.assertIn("（本地）".encode("utf-8"), response.data)
                 response = client.post("/api-keys", data={"name": "Windows VM"})
                 self.assertEqual(response.status_code, 302)
                 response = client.get("/api-keys")

@@ -388,6 +388,7 @@ class Store:
                 "login_checked_at": "",
                 "page_fetch_mode": "browser",
                 "storage_mode": "local",
+                "storage_target_name": "",
                 "storage_api_url": "",
                 "storage_api_key": "",
                 "delay_seconds": "0.3",
@@ -418,6 +419,7 @@ class Store:
             "login_checked_at",
             "page_fetch_mode",
             "storage_mode",
+            "storage_target_name",
             "storage_api_url",
             "storage_api_key",
             "delay_seconds",
@@ -1584,6 +1586,7 @@ def create_app(db_path: Path) -> Flask:
                 "otp_enabled": "1" if request.form.get("otp_enabled") else "0",
                 "page_fetch_mode": "browser",
                 "storage_mode": request.form.get("storage_mode", "local"),
+                "storage_target_name": request.form.get("storage_target_name", ""),
                 "storage_api_url": request.form.get("storage_api_url", ""),
                 "storage_api_key": request.form.get("storage_api_key", ""),
                 "delay_seconds": request.form.get("delay_seconds", ""),
@@ -1845,25 +1848,34 @@ def render_page(
     login_checked_at = html.escape(config.get("login_checked_at") or "")
     otp_checked = "checked" if str(config.get("otp_enabled") or "0").lower() in {"1", "true", "yes", "on"} else ""
     storage_mode = str(config.get("storage_mode") or "local").lower()
+    storage_target_name = str(config.get("storage_target_name") or "").strip()
     storage_api_url = html.escape(config.get("storage_api_url") or "")
     storage_api_key = html.escape(config.get("storage_api_key") or "")
     database_path = html.escape(config.get("database_path") or str(DEFAULT_DATA_DIR / "das_cpm_photos.sqlite3"))
     storage_error_html = (
         f'<section class="panel error">远程存储连接失败：{html.escape(storage_error)}</section>' if storage_error else ""
     )
+    if storage_mode == "remote":
+        if not storage_target_name:
+            storage_target_name = urllib.parse.urlparse(config.get("storage_api_url") or "").hostname or "未设置"
+        storage_mode_label = f"远程-{storage_target_name}"
+    else:
+        storage_mode_label = "本地"
+    storage_mode_label = html.escape(storage_mode_label)
     user = html.escape(current_user_name())
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DAS 集装箱照片下载</title>
+<title>DAS 集装箱照片下载（{storage_mode_label}）</title>
 <style>
 body {{ margin:0; font-family: Arial, "Microsoft YaHei", sans-serif; color:#18242c; background:#f4f6f8; }}
 header {{ background:#184e57; color:white; padding:14px 28px; }}
 .header-inner {{ display:flex; align-items:center; justify-content:space-between; gap:12px; }}
 .header-button {{ background:rgba(255,255,255,0.16); border:1px solid rgba(255,255,255,0.34); padding:8px 13px; }}
 h1 {{ margin:0; font-size:21px; font-weight:700; letter-spacing:0; }}
+.storage-mode-label {{ font-size:15px; font-weight:500; opacity:0.9; }}
 h2 {{ margin:0 0 14px; font-size:17px; }}
 main {{ padding:18px 28px 36px; }}
 .grid {{ display:block; }}
@@ -1973,7 +1985,7 @@ setInterval(() => {{
 <body>
 <header>
   <div class="header-inner">
-    <h1>DAS 集装箱照片下载</h1>
+    <h1>DAS 集装箱照片下载 <span class="storage-mode-label">（{storage_mode_label}）</span></h1>
     <div class="actions">
       <span>当前用户：{user}</span>
       <a class="header-button" href="/labeler" style="color:white;text-decoration:none">照片标注</a>
@@ -2031,7 +2043,8 @@ setInterval(() => {{
             <div><label>本机照片目录（作为存储服务器时使用）</label><input name="output_dir" value="{html.escape(config.get("output_dir") or str(DEFAULT_PHOTO_DIR))}"></div>
             <div><label>本机数据库路径（修改后需重启）</label><input name="database_path" value="{database_path}"></div>
           </div>
-          <div class="row two">
+          <div class="row">
+            <div><label>远程存储名称</label><input name="storage_target_name" placeholder="例如：P3" value="{html.escape(config.get("storage_target_name") or "")}"></div>
             <div><label>远程存储 API 地址</label><input id="storage_api_url" name="storage_api_url" placeholder="http://P3-IP:8787" value="{storage_api_url}"></div>
             <div>
               <label>远程存储 API Key</label>

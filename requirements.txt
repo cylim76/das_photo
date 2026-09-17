@@ -1,1 +1,6 @@
 Flask>=3.0,<4
+PyAutoGUI>=0.9.54,<1
+PyGetWindow>=0.0.9,<1
+pyperclip>=1.11,<2
+rapidocr>=3.9,<4
+onnxruntime>=1.27,<2
