@@ -27,6 +27,12 @@ check_environment() {
         echo "没有找到启动脚本：${RUN_SCRIPT}"
         exit 1
     fi
+    case "$PROJECT_DIR" in
+        *[[:space:]]*)
+            echo "项目路径不能包含空格：${PROJECT_DIR}"
+            exit 1
+            ;;
+    esac
     if [ "$(id -u)" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
         echo "安装服务需要 root 权限，请使用 root 运行此脚本。"
         exit 1
@@ -47,8 +53,8 @@ After=network-online.target
 [Service]
 Type=simple
 User=${SERVICE_USER}
-WorkingDirectory="${PROJECT_DIR}"
-ExecStart=/bin/sh "${RUN_SCRIPT}"
+WorkingDirectory=${PROJECT_DIR}
+ExecStart=/bin/sh ${RUN_SCRIPT}
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
@@ -62,6 +68,12 @@ EOF
 
     run_as_root install -m 0644 "$TEMP_FILE" "$SERVICE_FILE"
     run_as_root systemctl daemon-reload
+    if ! run_as_root systemd-analyze verify "$SERVICE_FILE"; then
+        run_as_root rm -f "$SERVICE_FILE"
+        run_as_root systemctl daemon-reload
+        echo "服务文件校验失败，已撤销安装。"
+        exit 1
+    fi
     run_as_root systemctl enable "${SERVICE_NAME}.service"
     rm -f "$TEMP_FILE"
     trap - EXIT HUP INT TERM

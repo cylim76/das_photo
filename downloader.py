@@ -22,11 +22,12 @@ import urllib.request
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from flask import Flask, Response, jsonify, redirect, request, send_file, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.serving import WSGIRequestHandler
 
 from labeler import server as labeler_server
 
@@ -358,7 +359,14 @@ class Store:
                     message TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     started_at TEXT,
-                    finished_at TEXT
+                    finished_at TEXT,
+                    execution_mode TEXT NOT NULL DEFAULT 'local',
+                    client_key_id INTEGER,
+                    client_name TEXT NOT NULL DEFAULT '',
+                    overwrite INTEGER NOT NULL DEFAULT 0,
+                    claimed_at TEXT NOT NULL DEFAULT '',
+                    heartbeat_at TEXT NOT NULL DEFAULT '',
+                    cancel_requested INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS api_keys (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -373,6 +381,19 @@ class Store:
             photo_columns = {row["name"] for row in conn.execute("PRAGMA table_info(photos)")}
             if "relative_path" not in photo_columns:
                 conn.execute("ALTER TABLE photos ADD COLUMN relative_path TEXT NOT NULL DEFAULT ''")
+            job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+            job_migrations = {
+                "execution_mode": "TEXT NOT NULL DEFAULT 'local'",
+                "client_key_id": "INTEGER",
+                "client_name": "TEXT NOT NULL DEFAULT ''",
+                "overwrite": "INTEGER NOT NULL DEFAULT 0",
+                "claimed_at": "TEXT NOT NULL DEFAULT ''",
+                "heartbeat_at": "TEXT NOT NULL DEFAULT ''",
+                "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for column, definition in job_migrations.items():
+                if column not in job_columns:
+                    conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {definition}")
             defaults = {
                 "base_url": DEFAULT_BASE_URL,
                 "output_dir": str(DEFAULT_PHOTO_DIR),
@@ -391,6 +412,9 @@ class Store:
                 "storage_target_name": "",
                 "storage_api_url": "",
                 "storage_api_key": "",
+                "download_execution_mode": "local",
+                "dispatch_client_key_id": "",
+                "accept_remote_jobs": "0",
                 "delay_seconds": "0.3",
                 "timeout_seconds": "30",
             }
@@ -422,6 +446,9 @@ class Store:
             "storage_target_name",
             "storage_api_url",
             "storage_api_key",
+            "download_execution_mode",
+            "dispatch_client_key_id",
+            "accept_remote_jobs",
             "delay_seconds",
             "timeout_seconds",
         }
@@ -434,14 +461,36 @@ class Store:
                         (key, str(value or "").strip()),
                     )
 
-    def create_job(self, start_id: int, end_id: int) -> int:
+    def create_job(
+        self,
+        start_id: int,
+        end_id: int,
+        *,
+        execution_mode: str = "local",
+        client_key_id: int | None = None,
+        client_name: str = "",
+        overwrite: bool = False,
+    ) -> int:
         with self.connect() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO jobs(start_id, end_id, status, total, created_at, message)
-                VALUES(?, ?, 'queued', ?, ?, '')
+                INSERT INTO jobs(
+                    start_id, end_id, status, total, created_at, message,
+                    execution_mode, client_key_id, client_name, overwrite
+                )
+                VALUES(?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (start_id, end_id, end_id - start_id + 1, now_text()),
+                (
+                    start_id,
+                    end_id,
+                    end_id - start_id + 1,
+                    now_text(),
+                    "等待远程客户端下载" if execution_mode == "remote" else "",
+                    execution_mode,
+                    client_key_id,
+                    client_name,
+                    1 if overwrite else 0,
+                ),
             )
             return int(cur.lastrowid)
 
@@ -453,16 +502,116 @@ class Store:
         with self.connect() as conn:
             conn.execute(f"UPDATE jobs SET {assignments} WHERE id=?", params)
 
-    def mark_latest_running_job_stopping(self) -> None:
+    def get_job(self, job_id: int) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM jobs WHERE id=?", (int(job_id),)).fetchone()
+            return dict(row) if row else None
+
+    def request_cancel_latest_job(self) -> dict | None:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT id FROM jobs WHERE status='running' ORDER BY id DESC LIMIT 1"
+                """
+                SELECT * FROM jobs
+                WHERE status IN ('queued','claimed','running','stopping')
+                ORDER BY id DESC LIMIT 1
+                """
             ).fetchone()
-            if row:
+            if not row:
+                return None
+            item = dict(row)
+            if item.get("execution_mode") == "remote" and item.get("status") == "queued":
                 conn.execute(
-                    "UPDATE jobs SET status='stopping', message=? WHERE id=?",
+                    "UPDATE jobs SET status='cancelled', cancel_requested=1, finished_at=?, message=? WHERE id=?",
+                    (now_text(), "远程任务已取消", row["id"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE jobs SET status='stopping', cancel_requested=1, message=? WHERE id=?",
                     ("已请求停止，当前 ID 完成后停止", row["id"]),
                 )
+            return item
+
+    def claim_dispatch_job(self, client_key_id: int, client_name: str) -> dict | None:
+        cutoff = (datetime.now() - timedelta(seconds=90)).strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = now_text()
+        with self._lock, self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status='queued', claimed_at='', heartbeat_at='', message='客户端连接中断，等待重新领取'
+                WHERE execution_mode='remote' AND client_key_id=?
+                  AND status IN ('claimed','running') AND cancel_requested=0
+                  AND heartbeat_at<>'' AND heartbeat_at<?
+                """,
+                (int(client_key_id), cutoff),
+            )
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status='cancelled', finished_at=?, message='客户端连接中断后取消'
+                WHERE execution_mode='remote' AND client_key_id=?
+                  AND status IN ('claimed','running','stopping') AND cancel_requested=1
+                  AND heartbeat_at<>'' AND heartbeat_at<?
+                """,
+                (timestamp, int(client_key_id), cutoff),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE execution_mode='remote' AND client_key_id=? AND status='queued'
+                ORDER BY id LIMIT 1
+                """,
+                (int(client_key_id),),
+            ).fetchone()
+            if not row:
+                return None
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status='claimed', client_name=?, claimed_at=?, heartbeat_at=?, message=?
+                WHERE id=? AND status='queued'
+                """,
+                (client_name, timestamp, timestamp, f"已由 {client_name} 领取", row["id"]),
+            )
+            claimed = conn.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
+            return dict(claimed) if claimed else None
+
+    def report_dispatch_job(self, client_key_id: int, job_id: int, payload: dict) -> dict | None:
+        allowed = {
+            "status",
+            "processed",
+            "found_containers",
+            "photos_downloaded",
+            "skipped_empty",
+            "failed",
+            "current_id",
+            "max_completed_id",
+            "message",
+            "started_at",
+            "finished_at",
+        }
+        with self._lock, self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE id=? AND execution_mode='remote' AND client_key_id=?",
+                (int(job_id), int(client_key_id)),
+            ).fetchone()
+            if not row:
+                return None
+            values = {key: payload[key] for key in allowed if key in payload}
+            if row["cancel_requested"] and values.get("status") not in {"finished", "failed", "cancelled"}:
+                values["status"] = "stopping"
+            values["heartbeat_at"] = now_text()
+            if values.get("status") == "running" and not row["started_at"]:
+                values["started_at"] = now_text()
+            if values.get("status") in {"finished", "failed", "cancelled"} and not values.get("finished_at"):
+                values["finished_at"] = now_text()
+            assignments = ", ".join(f"{key}=?" for key in values)
+            conn.execute(
+                f"UPDATE jobs SET {assignments} WHERE id=?",
+                [*values.values(), int(job_id)],
+            )
+            updated = conn.execute("SELECT * FROM jobs WHERE id=?", (int(job_id),)).fetchone()
+            return dict(updated) if updated else None
 
     def existing_containers_in_range(self, start_id: int, end_id: int) -> list[dict]:
         with self.connect() as conn:
@@ -731,6 +880,11 @@ class Store:
             rows = conn.execute("SELECT * FROM api_keys ORDER BY id DESC").fetchall()
             return [dict(row) for row in rows]
 
+    def get_api_key(self, key_id: int) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM api_keys WHERE id=?", (int(key_id),)).fetchone()
+            return dict(row) if row else None
+
     def set_api_key_enabled(self, key_id: int, enabled: bool) -> None:
         with self.connect() as conn:
             conn.execute("UPDATE api_keys SET enabled=? WHERE id=?", (1 if enabled else 0, int(key_id)))
@@ -792,7 +946,14 @@ class RemoteStorageClient:
             float(config.get("timeout_seconds") or 30),
         )
 
-    def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> dict:
         data = None
         headers = {"X-DAS-API-Key": self.api_key, "Accept": "application/json"}
         if payload is not None:
@@ -802,7 +963,7 @@ class RemoteStorageClient:
         for attempt in range(3):
             req = urllib.request.Request(self.base_url + path, data=data, headers=headers, method=method)
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
                     body = resp.read()
                 break
             except urllib.error.HTTPError as exc:
@@ -829,6 +990,22 @@ class RemoteStorageClient:
 
     def summary(self) -> dict:
         return self._request("GET", "/storage-api/summary")
+
+    def claim_dispatch_job(self, wait_seconds: int = 20) -> dict:
+        wait_seconds = max(1, min(25, int(wait_seconds)))
+        return self._request(
+            "POST",
+            f"/storage-api/dispatch/claim?wait={wait_seconds}",
+            {},
+            timeout=wait_seconds + 5,
+        )
+
+    def report_dispatch_job(self, job_id: int, values: dict) -> dict:
+        return self._request(
+            "POST",
+            "/storage-api/dispatch/report",
+            {"job_id": int(job_id), **values},
+        )
 
     def recent(self, container_limit: int = 40, photo_limit: int = 12) -> dict:
         query = urllib.parse.urlencode({"containers": container_limit, "photos": photo_limit})
@@ -908,7 +1085,7 @@ class Downloader:
             if self._thread and self._thread.is_alive():
                 raise RuntimeError("已有下载任务正在运行")
             self._stop.clear()
-            job_id = self.store.create_job(start_id, end_id)
+            job_id = self.store.create_job(start_id, end_id, overwrite=overwrite)
             self._thread = threading.Thread(
                 target=self._run_job,
                 args=(job_id, start_id, end_id, overwrite),
@@ -919,6 +1096,10 @@ class Downloader:
 
     def cancel(self) -> None:
         self._stop.set()
+
+    def is_running(self) -> bool:
+        with self._lock:
+            return bool(self._thread and self._thread.is_alive())
 
     def _remote_storage(self, config: dict[str, str]) -> RemoteStorageClient | None:
         if (config.get("storage_mode") or "local").strip().lower() != "remote":
@@ -1151,6 +1332,96 @@ class Downloader:
             self.store.update_job(job_id, status="failed", finished_at=now_text(), message=str(exc)[:500])
 
 
+class RemoteJobWorker:
+    TERMINAL_STATUSES = {"finished", "failed", "cancelled"}
+    REPORT_FIELDS = {
+        "status",
+        "processed",
+        "found_containers",
+        "photos_downloaded",
+        "skipped_empty",
+        "failed",
+        "current_id",
+        "max_completed_id",
+        "message",
+        "started_at",
+        "finished_at",
+    }
+
+    def __init__(self, store: Store, downloader: Downloader):
+        self.store = store
+        self.downloader = downloader
+        self._thread = threading.Thread(target=self._run, daemon=True, name="remote-download-worker")
+
+    def start(self) -> None:
+        self._thread.start()
+
+    @staticmethod
+    def _enabled(config: dict[str, str]) -> bool:
+        return (
+            (config.get("storage_mode") or "local").lower() == "remote"
+            and str(config.get("accept_remote_jobs") or "0").lower() in {"1", "true", "yes", "on"}
+            and bool((config.get("storage_api_url") or "").strip())
+            and bool((config.get("storage_api_key") or "").strip())
+        )
+
+    def _run(self) -> None:
+        while True:
+            config = self.store.get_config()
+            if not self._enabled(config) or self.downloader.is_running():
+                time.sleep(3)
+                continue
+            try:
+                client = RemoteStorageClient.from_config(config)
+                dispatch_job = client.claim_dispatch_job(20)
+            except Exception:
+                time.sleep(5)
+                continue
+            if not dispatch_job or not dispatch_job.get("id"):
+                continue
+            self._execute(client, dispatch_job)
+
+    def _execute(self, client: RemoteStorageClient, dispatch_job: dict) -> None:
+        dispatch_job_id = int(dispatch_job["id"])
+        try:
+            local_job_id = self.downloader.start(
+                int(dispatch_job["start_id"]),
+                int(dispatch_job["end_id"]),
+                overwrite=bool(dispatch_job.get("overwrite")),
+            )
+        except Exception as exc:
+            try:
+                client.report_dispatch_job(
+                    dispatch_job_id,
+                    {"status": "failed", "message": str(exc)[:500], "finished_at": now_text()},
+                )
+            except Exception:
+                pass
+            return
+
+        while True:
+            local_job = self.store.get_job(local_job_id) or {}
+            report = {key: local_job.get(key) for key in self.REPORT_FIELDS if key in local_job}
+            if report.get("status") == "queued":
+                report["status"] = "claimed"
+            try:
+                remote_job = client.report_dispatch_job(dispatch_job_id, report)
+                if remote_job.get("cancel_requested"):
+                    self.downloader.cancel()
+            except Exception:
+                pass
+            if local_job.get("status") in self.TERMINAL_STATUSES:
+                return
+            time.sleep(2)
+
+
+class QuietRequestHandler(WSGIRequestHandler):
+    def log_request(self, code="-", size="-"):
+        if self.path.startswith("/storage-api/dispatch/claim") and str(code) == "204":
+            return
+        super().log_request(code, size)
+
+
 class SsoLoginRunner:
     def __init__(self, store: Store):
         self.store = store
@@ -1201,11 +1472,19 @@ class SsoLoginRunner:
             self.store.save_config({"login_status": f"登录失败: {exc}", "login_checked_at": now_text()})
 
 
-def create_app(db_path: Path) -> Flask:
+def create_app(db_path: Path, *, start_remote_worker: bool = False) -> Flask:
     store = Store(db_path)
     downloader = Downloader(store)
+    dispatch_condition = threading.Condition()
     app = Flask(__name__)
     app.secret_key = get_secret_key()
+    app.extensions["das_store"] = store
+    app.extensions["das_downloader"] = downloader
+    app.extensions["das_dispatch_condition"] = dispatch_condition
+    if start_remote_worker:
+        remote_worker = RemoteJobWorker(store, downloader)
+        remote_worker.start()
+        app.extensions["das_remote_worker"] = remote_worker
 
     def is_logged_in() -> bool:
         return bool(session.get("user"))
@@ -1329,6 +1608,37 @@ def create_app(db_path: Path) -> Flask:
             "photo_root": config.get("output_dir"),
             "database": str(store.db_path),
         })
+
+    @app.post("/storage-api/dispatch/claim")
+    def storage_api_dispatch_claim():
+        key_info, error = require_storage_api_key()
+        if error:
+            return error
+        wait_seconds = max(1, min(25, int(request.args.get("wait") or 20)))
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            job = store.claim_dispatch_job(int(key_info["id"]), str(key_info.get("name") or "下载客户端"))
+            if job:
+                return jsonify(job)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return Response(status=204)
+            with dispatch_condition:
+                dispatch_condition.wait(timeout=min(remaining, 5))
+
+    @app.post("/storage-api/dispatch/report")
+    def storage_api_dispatch_report():
+        key_info, error = require_storage_api_key()
+        if error:
+            return error
+        payload = request.get_json(silent=True) or {}
+        job_id = int(payload.get("job_id") or 0)
+        if not job_id:
+            return jsonify({"error": "缺少任务 ID"}), 400
+        job = store.report_dispatch_job(int(key_info["id"]), job_id, payload)
+        if not job:
+            return jsonify({"error": "任务不存在或不属于当前客户端"}), 404
+        return jsonify(job)
 
     @app.get("/storage-api/summary")
     def storage_api_summary():
@@ -1466,7 +1776,7 @@ def create_app(db_path: Path) -> Flask:
         config["database_path"] = str(store.db_path)
         summary, containers, photos, storage_error = downloader.storage_summary()
         return Response(
-            render_page(config, summary, containers, photos, storage_error),
+            render_page(config, summary, containers, photos, store.list_api_keys(), storage_error),
             mimetype="text/html; charset=utf-8",
         )
 
@@ -1589,6 +1899,9 @@ def create_app(db_path: Path) -> Flask:
                 "storage_target_name": request.form.get("storage_target_name", ""),
                 "storage_api_url": request.form.get("storage_api_url", ""),
                 "storage_api_key": request.form.get("storage_api_key", ""),
+                "download_execution_mode": request.form.get("download_execution_mode", "local"),
+                "dispatch_client_key_id": request.form.get("dispatch_client_key_id", ""),
+                "accept_remote_jobs": "1" if request.form.get("accept_remote_jobs") else "0",
                 "delay_seconds": request.form.get("delay_seconds", ""),
                 "timeout_seconds": request.form.get("timeout_seconds", ""),
             }
@@ -1617,8 +1930,13 @@ def create_app(db_path: Path) -> Flask:
             return redirect(url_for("download_index"))
         end_id = start_id + max(1, count) - 1
         overwrite = request.form.get("confirm_overwrite") == "1"
+        config = store.get_config()
+        execution_mode = (config.get("download_execution_mode") or "local").lower()
         try:
-            existing = downloader.existing_containers_in_range(start_id, end_id)
+            if execution_mode == "remote":
+                existing = store.existing_containers_in_range(start_id, end_id)
+            else:
+                existing = downloader.existing_containers_in_range(start_id, end_id)
         except Exception as exc:
             store.mark_no_record(start_id, "start_failed", str(exc)[:500])
             return redirect(url_for("download_index"))
@@ -1628,15 +1946,38 @@ def create_app(db_path: Path) -> Flask:
                 mimetype="text/html; charset=utf-8",
             )
         try:
-            downloader.start(start_id, end_id, overwrite=overwrite)
+            if execution_mode == "remote":
+                client_key_id = int(config.get("dispatch_client_key_id") or 0)
+                key_info = store.get_api_key(client_key_id) if client_key_id else None
+                if not key_info or not key_info.get("enabled"):
+                    raise RuntimeError("请选择已启用的远程下载客户端")
+                store.create_job(
+                    start_id,
+                    end_id,
+                    execution_mode="remote",
+                    client_key_id=client_key_id,
+                    client_name=str(key_info.get("name") or "下载客户端"),
+                    overwrite=overwrite,
+                )
+                with dispatch_condition:
+                    dispatch_condition.notify_all()
+            else:
+                downloader.start(start_id, end_id, overwrite=overwrite)
         except Exception as exc:
-            store.mark_no_record(start_id, "start_failed", str(exc))
+            failed_job_id = store.create_job(start_id, end_id, execution_mode=execution_mode)
+            store.update_job(
+                failed_job_id,
+                status="failed",
+                finished_at=now_text(),
+                message=str(exc)[:500],
+            )
         return redirect(url_for("download_index"))
 
     @app.post("/jobs/cancel")
     def cancel_job():
-        store.mark_latest_running_job_stopping()
-        downloader.cancel()
+        job = store.request_cancel_latest_job()
+        if job and job.get("execution_mode") != "remote":
+            downloader.cancel()
         return redirect(url_for("download_index"))
 
     @app.get("/api/status")
@@ -1827,6 +2168,7 @@ def render_page(
     summary: dict,
     containers: list[dict],
     photos: list[dict],
+    api_keys: list[dict],
     storage_error: str = "",
 ) -> str:
     job = summary.get("latest_job") or {}
@@ -1850,6 +2192,33 @@ def render_page(
     storage_target_name = str(config.get("storage_target_name") or "").strip()
     storage_api_url = html.escape(config.get("storage_api_url") or "")
     storage_api_key = html.escape(config.get("storage_api_key") or "")
+    download_execution_mode = str(config.get("download_execution_mode") or "local").lower()
+    dispatch_client_key_id = str(config.get("dispatch_client_key_id") or "")
+    accept_remote_jobs_checked = (
+        "checked"
+        if str(config.get("accept_remote_jobs") or "0").lower() in {"1", "true", "yes", "on"}
+        else ""
+    )
+    client_options = ['<option value="">请选择客户端</option>']
+    dispatch_client_name = "未选择"
+    for key_info in api_keys:
+        if not key_info.get("enabled"):
+            continue
+        last_used = str(key_info.get("last_used_at") or "")
+        online = False
+        try:
+            online = datetime.now() - datetime.strptime(last_used, "%Y-%m-%d %H:%M:%S") < timedelta(seconds=45)
+        except ValueError:
+            pass
+        key_id = str(key_info.get("id") or "")
+        selected = "selected" if key_id == dispatch_client_key_id else ""
+        if selected:
+            dispatch_client_name = str(key_info.get("name") or "下载客户端")
+        label = f'{key_info.get("name") or "下载客户端"}（{"在线" if online else "离线"}）'
+        client_options.append(
+            f'<option value="{html.escape(key_id)}" {selected}>{html.escape(label)}</option>'
+        )
+    dispatch_client_options = "".join(client_options)
     database_path = html.escape(config.get("database_path") or str(DEFAULT_DATA_DIR / "das_cpm_photos.sqlite3"))
     storage_error_html = (
         f'<section class="panel error">远程存储连接失败：{html.escape(storage_error)}</section>' if storage_error else ""
@@ -1860,6 +2229,10 @@ def render_page(
         storage_mode_label = f"远程-{storage_target_name}"
     else:
         storage_mode_label = "本地"
+    if download_execution_mode == "remote":
+        storage_mode_label += f"；远程执行-{dispatch_client_name}"
+    else:
+        storage_mode_label += "；本机执行"
     storage_mode_label = html.escape(storage_mode_label)
     user = html.escape(current_user_name())
     return f"""<!doctype html>
@@ -1963,7 +2336,7 @@ function testStorage() {{
     result.textContent = '连接成功：' + (data.key_name || '') + '，照片目录：' + (data.photo_root || '');
   }}).catch(err => {{ result.textContent = '连接失败：' + err.message; }});
 }}
-const activeJobStatuses = new Set(['queued', 'running', 'stopping']);
+const activeJobStatuses = new Set(['queued', 'claimed', 'running', 'stopping']);
 const remoteStorageMode = {str(is_remote_storage).lower()};
 let lastJobStatus = {initial_job_status};
 function refreshJobStatus() {{
@@ -2081,6 +2454,23 @@ window.addEventListener('DOMContentLoaded', () => {{
             <span id="storage-test-result" class="hint"></span>
           </div>
           <div class="hint" style="margin-bottom:12px">远程模式下，照片和箱号数据写入目标服务器；本机数据库仅保留下载设置与任务进度。</div>
+          <div class="row">
+            <div>
+              <label>下载任务执行方式</label>
+              <select name="download_execution_mode">
+                <option value="local" {"selected" if download_execution_mode == "local" else ""}>本机执行下载</option>
+                <option value="remote" {"selected" if download_execution_mode == "remote" else ""}>发送给远程客户端</option>
+              </select>
+            </div>
+            <div>
+              <label>远程下载客户端</label>
+              <select name="dispatch_client_key_id">{dispatch_client_options}</select>
+            </div>
+            <div>
+              <label class="checkline" style="margin-top:25px"><input type="checkbox" name="accept_remote_jobs" {accept_remote_jobs_checked}> 接受远程下载任务</label>
+            </div>
+          </div>
+          <div class="hint" style="margin-bottom:12px">P3 选择“发送给远程客户端”并指定设备；Windows 下载机选择“本机执行下载”、启用“接受远程下载任务”，同时使用 P3 的远程存储 API。</div>
           <div class="row">
             <div>
               <label>浏览器</label>
@@ -2246,10 +2636,10 @@ def main(argv: list[str] | None = None) -> int:
         or runtime_config.get("database_path", "").strip()
         or str(DEFAULT_DATA_DIR / "das_cpm_photos.sqlite3")
     )
-    app = create_app(Path(database_path).expanduser())
+    app = create_app(Path(database_path).expanduser(), start_remote_worker=True)
     print(f"DAS 集装箱照片下载工具: http://{args.host}:{args.port}")
     print(f"数据库: {database_path}")
-    app.run(host=args.host, port=args.port, threaded=True)
+    app.run(host=args.host, port=args.port, threaded=True, request_handler=QuietRequestHandler)
     return 0
 
 
