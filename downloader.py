@@ -1641,10 +1641,7 @@ def create_app(db_path: Path) -> Flask:
 
     @app.get("/api/status")
     def api_status():
-        summary, _containers, _photos, storage_error = downloader.storage_summary()
-        if storage_error:
-            summary["storage_error"] = storage_error
-        return jsonify(summary)
+        return jsonify(store.summary())
 
     @app.get("/photo/<int:photo_id>")
     def photo_file(photo_id: int):
@@ -1848,6 +1845,8 @@ def render_page(
     login_checked_at = html.escape(config.get("login_checked_at") or "")
     otp_checked = "checked" if str(config.get("otp_enabled") or "0").lower() in {"1", "true", "yes", "on"} else ""
     storage_mode = str(config.get("storage_mode") or "local").lower()
+    is_remote_storage = storage_mode == "remote"
+    initial_job_status = json.dumps(str(job.get("status") or ""), ensure_ascii=False)
     storage_target_name = str(config.get("storage_target_name") or "").strip()
     storage_api_url = html.escape(config.get("storage_api_url") or "")
     storage_api_key = html.escape(config.get("storage_api_key") or "")
@@ -1964,22 +1963,41 @@ function testStorage() {{
     result.textContent = '连接成功：' + (data.key_name || '') + '，照片目录：' + (data.photo_root || '');
   }}).catch(err => {{ result.textContent = '连接失败：' + err.message; }});
 }}
-window.addEventListener('DOMContentLoaded', recalcEndId);
-setInterval(() => {{
+const activeJobStatuses = new Set(['queued', 'running', 'stopping']);
+const remoteStorageMode = {str(is_remote_storage).lower()};
+let lastJobStatus = {initial_job_status};
+function refreshJobStatus() {{
   fetch('/api/status').then(r => r.json()).then(s => {{
     const j = s.latest_job || {{}};
-    document.getElementById('job-status').textContent = j.status || '无';
+    const currentStatus = j.status || '';
+    const wasActive = activeJobStatuses.has(lastJobStatus);
+    document.getElementById('job-status').textContent = currentStatus || '无';
     document.getElementById('job-message').textContent = j.message || '';
     document.getElementById('job-current').textContent = j.current_id || '';
     document.getElementById('job-progress-text').textContent = (j.processed || 0) + ' / ' + (j.total || 0);
     const pct = j.total ? Math.min(100, Math.round((j.processed || 0) * 1000 / j.total) / 10) : 0;
     document.getElementById('job-bar').style.width = pct + '%';
-    document.getElementById('max-done').textContent = s.max_completed_id || '';
-    const maxPhoto = document.getElementById('max-photo');
-    if (maxPhoto) maxPhoto.textContent = s.max_with_photos_id || '';
-    document.getElementById('download-containers').textContent = s.containers || 0;
-  }}).catch(() => {{}});
-}}, 2500);
+    const maxDone = j.max_completed_id || s.max_completed_id;
+    if (maxDone) document.getElementById('max-done').textContent = maxDone;
+    if (!remoteStorageMode) {{
+      const maxPhoto = document.getElementById('max-photo');
+      if (maxPhoto) maxPhoto.textContent = s.max_with_photos_id || '';
+      document.getElementById('download-containers').textContent = s.containers || 0;
+    }}
+    lastJobStatus = currentStatus;
+    if (activeJobStatuses.has(currentStatus)) {{
+      window.setTimeout(refreshJobStatus, 2500);
+    }} else if (wasActive) {{
+      window.location.reload();
+    }}
+  }}).catch(() => {{
+    if (activeJobStatuses.has(lastJobStatus)) window.setTimeout(refreshJobStatus, 5000);
+  }});
+}}
+window.addEventListener('DOMContentLoaded', () => {{
+  recalcEndId();
+  if (activeJobStatuses.has(lastJobStatus)) window.setTimeout(refreshJobStatus, 1000);
+}});
 </script>
 </head>
 <body>

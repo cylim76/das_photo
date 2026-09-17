@@ -38,6 +38,27 @@ class StorageApiIntegrationTest(unittest.TestCase):
                 self.assertIn("生成 API Key".encode("utf-8"), response.data)
                 self.assertIn("Windows VM".encode("utf-8"), response.data)
 
+    def test_idle_status_check_does_not_contact_remote_storage(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / "photos.sqlite3"
+            store = Store(database)
+            store.save_config({
+                "storage_mode": "remote",
+                "storage_api_url": "http://127.0.0.1:1",
+                "storage_api_key": "test-key",
+            })
+            app = create_app(database)
+            app.config.update(TESTING=True)
+            client = app.test_client()
+            with client.session_transaction() as session:
+                session["user"] = "admin"
+            users = {"admin": {"name": "admin", "role": "admin"}}
+            with patch("downloader.ensure_users", return_value=users):
+                with patch("downloader.RemoteStorageClient.from_config") as remote:
+                    response = client.get("/api/status")
+            self.assertEqual(response.status_code, 200)
+            remote.assert_not_called()
+
     def test_remote_client_uploads_photo_and_metadata(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

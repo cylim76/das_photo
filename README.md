@@ -39,12 +39,7 @@ chmod +x run.sh run_downloader.sh run_labeler.sh
 ./run.sh
 ```
 
-服务器后台入口：
-
-```bash
-chmod +x run_server.sh
-./run_server.sh
-```
+在有桌面的 Linux 上，`run.sh` 默认会尝试打开浏览器；由 systemd 启动时会自动关闭这个行为。
 
 ## 安装依赖
 
@@ -93,7 +88,7 @@ set DAS_PHOTO_ROOT=D:\RPA\photos
 1. 在下载页面“设置”中选择“本地一体模式”。
 2. 设置 P3 本机的照片目录和数据库路径。
 3. 打开“API Key”页面，为每台下载电脑生成一个 Key。
-4. 使用 `run_server.sh` 启动服务，并确保下载电脑可以访问 `8787` 端口。
+4. 使用 `run.sh` 或 `das_photo` 系统服务启动，并确保下载电脑可以访问 `8787` 端口。
 
 存储服务器收到上传后，会先校验文件大小和 SHA-256，再把图片写入临时文件并原子改名，最后更新本机 SQLite。
 
@@ -134,38 +129,22 @@ API Key 在服务器管理页面中可以随时查看、复制、停用或删除
 
 ## systemd 服务
 
-Linux 服务器上建议用 `run_server.sh` 作为 systemd 入口。它不会自动打开浏览器，只负责启动 Web 服务。
-
-示例服务文件：
-
-```ini
-[Unit]
-Description=DAS Container Photo Tool
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/data/rpa/container_photo_tool
-ExecStart=/data/rpa/container_photo_tool/run_server.sh
-Restart=always
-RestartSec=5
-Environment=DAS_PHOTO_ROOT=/data/rpa/photos
-Environment=DAS_PHOTO_DB=/data/rpa/das_photo/data/das_cpm_photos.sqlite3
-Environment=DAS_PHOTO_HOST=0.0.0.0
-Environment=DAS_PHOTO_PORT=8787
-
-[Install]
-WantedBy=multi-user.target
-```
-
-常用命令：
+Linux 服务器可以使用项目自带的菜单脚本安装或删除 `das_photo.service`：
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable das-photo
-sudo systemctl start das-photo
-sudo systemctl stop das-photo
-sudo systemctl restart das-photo
-sudo systemctl status das-photo
-journalctl -u das-photo -f
+chmod +x service_manager.sh run.sh
+./service_manager.sh
+```
+
+输入 `1` 会根据当前项目路径和当前用户生成服务文件，并设置为开机启动；安装后不会立即启动。
+输入 `2` 会停止、禁用并删除服务，但不会删除项目代码、数据库或照片。
+
+安装完成后的常用命令：
+
+```bash
+sudo systemctl start das_photo
+sudo systemctl stop das_photo
+sudo systemctl restart das_photo
+sudo systemctl status das_photo
+journalctl -u das_photo -f
 ```
