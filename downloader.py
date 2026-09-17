@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import functools
 import hashlib
 import html
@@ -18,6 +19,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +44,7 @@ DETAIL_PATH = "/Manage/cpm/V_CPM_DETAIL.aspx?cpm_id={cpm_id}"
 DAS_LOGIN_SSO_URL = "http://das.china.lge.com:7005/LoginSSO.aspx"
 USERS_PATH = DEFAULT_DATA_DIR / "users.json"
 SECRET_KEY_PATH = DEFAULT_DATA_DIR / "secret_key.txt"
+RUNTIME_CONFIG_PATH = DEFAULT_DATA_DIR / "runtime_config.json"
 
 
 def is_foreign_windows_path(value: str) -> bool:
@@ -66,6 +70,23 @@ def write_json_file(path: Path, data) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
+
+
+def get_runtime_config() -> dict[str, str]:
+    config = read_json_file(RUNTIME_CONFIG_PATH, {})
+    if not isinstance(config, dict):
+        config = {}
+    return {
+        "database_path": str(config.get("database_path") or "").strip(),
+    }
+
+
+def save_runtime_config(values: dict[str, str]) -> dict[str, str]:
+    config = get_runtime_config()
+    if "database_path" in values:
+        config["database_path"] = str(values.get("database_path") or "").strip()
+    write_json_file(RUNTIME_CONFIG_PATH, config)
+    return config
 
 
 def get_secret_key() -> str:
@@ -265,10 +286,18 @@ class Store:
         self._lock = threading.Lock()
         self.init_db()
 
-    def connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def connect(self):
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def init_db(self) -> None:
         with self.connect() as conn:
@@ -307,6 +336,7 @@ class Store:
                     source_url TEXT NOT NULL,
                     thumb_url TEXT NOT NULL DEFAULT '',
                     local_path TEXT NOT NULL DEFAULT '',
+                    relative_path TEXT NOT NULL DEFAULT '',
                     file_size INTEGER NOT NULL DEFAULT 0,
                     sha256 TEXT NOT NULL DEFAULT '',
                     downloaded_at TEXT NOT NULL DEFAULT '',
@@ -330,8 +360,19 @@ class Store:
                     started_at TEXT,
                     finished_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS api_keys (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL DEFAULT '',
+                    api_key TEXT NOT NULL UNIQUE,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT NOT NULL DEFAULT ''
+                );
                 """
             )
+            photo_columns = {row["name"] for row in conn.execute("PRAGMA table_info(photos)")}
+            if "relative_path" not in photo_columns:
+                conn.execute("ALTER TABLE photos ADD COLUMN relative_path TEXT NOT NULL DEFAULT ''")
             defaults = {
                 "base_url": DEFAULT_BASE_URL,
                 "output_dir": str(DEFAULT_PHOTO_DIR),
@@ -346,6 +387,9 @@ class Store:
                 "login_status": "未登录",
                 "login_checked_at": "",
                 "page_fetch_mode": "browser",
+                "storage_mode": "local",
+                "storage_api_url": "",
+                "storage_api_key": "",
                 "delay_seconds": "0.3",
                 "timeout_seconds": "30",
             }
@@ -373,6 +417,9 @@ class Store:
             "login_status",
             "login_checked_at",
             "page_fetch_mode",
+            "storage_mode",
+            "storage_api_url",
+            "storage_api_key",
             "delay_seconds",
             "timeout_seconds",
         }
@@ -457,6 +504,28 @@ class Store:
         return len(removed_dirs)
 
     def upsert_container(self, item: ParsedContainer, status: str, message: str) -> None:
+        self.upsert_container_record(
+            {
+                "cpm_id": item.cpm_id,
+                "container_no": item.container_no,
+                "seal_no": item.seal_no,
+                "begin_date": item.begin_date,
+                "end_date": item.end_date,
+                "product_type": item.product_type,
+                "packing_type": item.packing_type,
+                "use_time": item.use_time,
+                "remark": item.remark,
+                "status_text": item.status_text,
+                "created_by": item.created_by,
+                "file_count": item.file_count,
+                "photo_count": len(item.photos),
+                "download_status": status,
+                "message": message,
+                "scanned_at": now_text(),
+            }
+        )
+
+    def upsert_container_record(self, item: dict) -> None:
         with self.connect() as conn:
             conn.execute(
                 """
@@ -484,34 +553,60 @@ class Store:
                     scanned_at=excluded.scanned_at
                 """,
                 (
-                    item.cpm_id,
-                    item.container_no,
-                    item.seal_no,
-                    item.begin_date,
-                    item.end_date,
-                    item.product_type,
-                    item.packing_type,
-                    item.use_time,
-                    item.remark,
-                    item.status_text,
-                    item.created_by,
-                    item.file_count,
-                    len(item.photos),
-                    status,
-                    message,
-                    now_text(),
+                    int(item.get("cpm_id") or 0),
+                    str(item.get("container_no") or ""),
+                    str(item.get("seal_no") or ""),
+                    str(item.get("begin_date") or ""),
+                    str(item.get("end_date") or ""),
+                    str(item.get("product_type") or ""),
+                    str(item.get("packing_type") or ""),
+                    str(item.get("use_time") or ""),
+                    str(item.get("remark") or ""),
+                    str(item.get("status_text") or ""),
+                    str(item.get("created_by") or ""),
+                    int(item.get("file_count") or 0),
+                    int(item.get("photo_count") or 0),
+                    str(item.get("download_status") or ""),
+                    str(item.get("message") or ""),
+                    str(item.get("scanned_at") or now_text()),
                 ),
             )
 
-    def upsert_photo(self, item: ParsedPhoto, cpm_id: int, local_path: Path, file_size: int, digest: str) -> None:
+    def upsert_photo(
+        self,
+        item: ParsedPhoto,
+        cpm_id: int,
+        local_path: Path,
+        file_size: int,
+        digest: str,
+        relative_path: str = "",
+    ) -> int:
+        return self.upsert_photo_record(
+            {
+                "cpm_id": cpm_id,
+                "step_code": item.step_code,
+                "step_no": item.step_no,
+                "step_name": item.step_name,
+                "photo_label": item.label,
+                "source_url": item.source_url,
+                "thumb_url": item.thumb_url,
+                "local_path": str(local_path),
+                "relative_path": relative_path,
+                "file_size": file_size,
+                "sha256": digest,
+                "downloaded_at": now_text(),
+            }
+        )
+
+    def upsert_photo_record(self, item: dict) -> int:
         with self.connect() as conn:
             conn.execute(
                 """
                 INSERT INTO photos(
                     cpm_id, step_code, step_no, step_name, photo_label, source_url,
-                    thumb_url, local_path, file_size, sha256, downloaded_at
+                    thumb_url, local_path, relative_path, file_size, sha256, downloaded_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(cpm_id, source_url) DO UPDATE SET
                     step_code=excluded.step_code,
                     step_no=excluded.step_no,
@@ -519,26 +614,38 @@ class Store:
                     photo_label=excluded.photo_label,
                     thumb_url=excluded.thumb_url,
                     local_path=excluded.local_path,
+                    relative_path=excluded.relative_path,
                     file_size=excluded.file_size,
                     sha256=excluded.sha256,
                     downloaded_at=excluded.downloaded_at
                 """,
                 (
-                    cpm_id,
-                    item.step_code,
-                    item.step_no,
-                    item.step_name,
-                    item.label,
-                    item.source_url,
-                    item.thumb_url,
-                    str(local_path),
-                    file_size,
-                    digest,
-                    now_text(),
+                    int(item.get("cpm_id") or 0),
+                    str(item.get("step_code") or ""),
+                    int(item.get("step_no") or 0),
+                    str(item.get("step_name") or ""),
+                    str(item.get("photo_label") or ""),
+                    str(item.get("source_url") or ""),
+                    str(item.get("thumb_url") or ""),
+                    str(item.get("local_path") or ""),
+                    str(item.get("relative_path") or ""),
+                    int(item.get("file_size") or 0),
+                    str(item.get("sha256") or ""),
+                    str(item.get("downloaded_at") or now_text()),
                 ),
             )
+            row = conn.execute(
+                "SELECT id FROM photos WHERE cpm_id=? AND source_url=?",
+                (int(item.get("cpm_id") or 0), str(item.get("source_url") or "")),
+            ).fetchone()
+            return int(row["id"])
 
     def mark_no_record(self, cpm_id: int, status: str, message: str) -> None:
+        self.mark_no_record_data(
+            {"cpm_id": cpm_id, "download_status": status, "message": message, "scanned_at": now_text()}
+        )
+
+    def mark_no_record_data(self, item: dict) -> None:
         with self.connect() as conn:
             conn.execute(
                 """
@@ -549,7 +656,12 @@ class Store:
                     message=excluded.message,
                     scanned_at=excluded.scanned_at
                 """,
-                (cpm_id, status, message, now_text()),
+                (
+                    int(item.get("cpm_id") or 0),
+                    str(item.get("download_status") or ""),
+                    str(item.get("message") or ""),
+                    str(item.get("scanned_at") or now_text()),
+                ),
             )
 
     def summary(self) -> dict:
@@ -602,6 +714,183 @@ class Store:
             row = conn.execute("SELECT local_path FROM photos WHERE id=?", (photo_id,)).fetchone()
             return Path(row["local_path"]) if row and row["local_path"] else None
 
+    def create_api_key(self, name: str) -> dict:
+        key = "das_" + secrets.token_urlsafe(32)
+        with self.connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO api_keys(name, api_key, enabled, created_at) VALUES(?, ?, 1, ?)",
+                (str(name or "下载设备").strip() or "下载设备", key, now_text()),
+            )
+            row = conn.execute("SELECT * FROM api_keys WHERE id=?", (cur.lastrowid,)).fetchone()
+            return dict(row)
+
+    def list_api_keys(self) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM api_keys ORDER BY id DESC").fetchall()
+            return [dict(row) for row in rows]
+
+    def set_api_key_enabled(self, key_id: int, enabled: bool) -> None:
+        with self.connect() as conn:
+            conn.execute("UPDATE api_keys SET enabled=? WHERE id=?", (1 if enabled else 0, int(key_id)))
+
+    def delete_api_key(self, key_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM api_keys WHERE id=?", (int(key_id),))
+
+    def authenticate_api_key(self, api_key: str) -> dict | None:
+        if not api_key:
+            return None
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM api_keys WHERE api_key=? AND enabled=1",
+                (api_key,),
+            ).fetchone()
+            if not row:
+                return None
+            conn.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (now_text(), row["id"]))
+            return dict(row)
+
+
+def parsed_container_record(item: ParsedContainer, status: str, message: str) -> dict:
+    return {
+        "cpm_id": item.cpm_id,
+        "container_no": item.container_no,
+        "seal_no": item.seal_no,
+        "begin_date": item.begin_date,
+        "end_date": item.end_date,
+        "product_type": item.product_type,
+        "packing_type": item.packing_type,
+        "use_time": item.use_time,
+        "remark": item.remark,
+        "status_text": item.status_text,
+        "created_by": item.created_by,
+        "file_count": item.file_count,
+        "photo_count": len(item.photos),
+        "download_status": status,
+        "message": message,
+        "scanned_at": now_text(),
+    }
+
+
+class RemoteStorageClient:
+    def __init__(self, base_url: str, api_key: str, timeout: float = 30):
+        self.base_url = str(base_url or "").strip().rstrip("/")
+        self.api_key = str(api_key or "").strip()
+        self.timeout = max(3.0, float(timeout or 30))
+        if not self.base_url:
+            raise ValueError("请填写存储 API 地址")
+        if not self.api_key:
+            raise ValueError("请填写存储 API Key")
+
+    @classmethod
+    def from_config(cls, config: dict[str, str]) -> "RemoteStorageClient":
+        return cls(
+            config.get("storage_api_url") or "",
+            config.get("storage_api_key") or "",
+            float(config.get("timeout_seconds") or 30),
+        )
+
+    def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
+        data = None
+        headers = {"X-DAS-API-Key": self.api_key, "Accept": "application/json"}
+        if payload is not None:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json; charset=utf-8"
+        body = b""
+        for attempt in range(3):
+            req = urllib.request.Request(self.base_url + path, data=data, headers=headers, method=method)
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    body = resp.read()
+                break
+            except urllib.error.HTTPError as exc:
+                error_body = exc.read().decode("utf-8", errors="replace")
+                try:
+                    detail = json.loads(error_body).get("error") or error_body
+                except Exception:
+                    detail = error_body
+                if exc.code >= 500 and attempt < 2:
+                    time.sleep(0.5 * (2**attempt))
+                    continue
+                raise RuntimeError(f"存储 API 返回 {exc.code}: {detail}") from exc
+            except urllib.error.URLError as exc:
+                if attempt < 2:
+                    time.sleep(0.5 * (2**attempt))
+                    continue
+                raise RuntimeError(f"无法连接存储 API：{exc.reason}") from exc
+        if not body:
+            return {}
+        return json.loads(body.decode("utf-8"))
+
+    def health(self) -> dict:
+        return self._request("GET", "/storage-api/health")
+
+    def summary(self) -> dict:
+        return self._request("GET", "/storage-api/summary")
+
+    def recent(self, container_limit: int = 40, photo_limit: int = 12) -> dict:
+        query = urllib.parse.urlencode({"containers": container_limit, "photos": photo_limit})
+        return self._request("GET", f"/storage-api/recent?{query}")
+
+    def existing_containers(self, start_id: int, end_id: int) -> list[dict]:
+        query = urllib.parse.urlencode({"start_id": start_id, "end_id": end_id})
+        return self._request("GET", f"/storage-api/existing?{query}").get("containers", [])
+
+    def purge_range(self, start_id: int, end_id: int) -> int:
+        result = self._request("POST", "/storage-api/purge", {"start_id": start_id, "end_id": end_id})
+        return int(result.get("removed_dirs") or 0)
+
+    def upsert_container(self, item: ParsedContainer, status: str, message: str) -> None:
+        self._request("POST", "/storage-api/container", parsed_container_record(item, status, message))
+
+    def mark_no_record(self, cpm_id: int, status: str, message: str) -> None:
+        self._request(
+            "POST",
+            "/storage-api/no-record",
+            {"cpm_id": cpm_id, "download_status": status, "message": message, "scanned_at": now_text()},
+        )
+
+    def upload_photo(
+        self,
+        parsed: ParsedContainer,
+        photo: ParsedPhoto,
+        data: bytes,
+        content_type: str,
+    ) -> dict:
+        digest = hashlib.sha256(data).hexdigest()
+        return self._request(
+            "POST",
+            "/storage-api/photo",
+            {
+                "cpm_id": parsed.cpm_id,
+                "container_no": parsed.container_no,
+                "begin_date": parsed.begin_date,
+                "end_date": parsed.end_date,
+                "step_code": photo.step_code,
+                "step_no": photo.step_no,
+                "step_name": photo.step_name,
+                "photo_label": photo.label,
+                "source_url": photo.source_url,
+                "thumb_url": photo.thumb_url,
+                "content_type": content_type,
+                "file_size": len(data),
+                "sha256": digest,
+                "file_base64": base64.b64encode(data).decode("ascii"),
+                "downloaded_at": now_text(),
+            },
+        )
+
+    def photo_bytes(self, photo_id: int) -> tuple[bytes, str]:
+        headers = {"X-DAS-API-Key": self.api_key}
+        req = urllib.request.Request(
+            self.base_url + f"/storage-api/photo/{int(photo_id)}", headers=headers, method="GET"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return resp.read(), resp.headers.get("Content-Type", "image/jpeg")
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"远程照片读取失败：HTTP {exc.code}") from exc
+
 
 class Downloader:
     def __init__(self, store: Store):
@@ -628,6 +917,46 @@ class Downloader:
 
     def cancel(self) -> None:
         self._stop.set()
+
+    def _remote_storage(self, config: dict[str, str]) -> RemoteStorageClient | None:
+        if (config.get("storage_mode") or "local").strip().lower() != "remote":
+            return None
+        return RemoteStorageClient.from_config(config)
+
+    def existing_containers_in_range(self, start_id: int, end_id: int) -> list[dict]:
+        config = self.store.get_config()
+        remote = self._remote_storage(config)
+        if remote:
+            return remote.existing_containers(start_id, end_id)
+        return self.store.existing_containers_in_range(start_id, end_id)
+
+    def storage_summary(self) -> tuple[dict, list[dict], list[dict], str]:
+        config = self.store.get_config()
+        local_summary = self.store.summary()
+        remote = self._remote_storage(config)
+        if not remote:
+            return local_summary, self.store.recent_containers(40), self.store.recent_photos(12), ""
+        try:
+            summary = remote.summary()
+            summary["latest_job"] = local_summary.get("latest_job")
+            recent = remote.recent(40, 12)
+            return summary, recent.get("containers", []), recent.get("photos", []), ""
+        except Exception as exc:
+            return local_summary, [], [], str(exc)
+
+    def _upsert_container(self, item: ParsedContainer, status: str, message: str, config: dict[str, str]) -> None:
+        remote = self._remote_storage(config)
+        if remote:
+            remote.upsert_container(item, status, message)
+        else:
+            self.store.upsert_container(item, status, message)
+
+    def _mark_no_record(self, cpm_id: int, status: str, message: str, config: dict[str, str]) -> None:
+        remote = self._remote_storage(config)
+        if remote:
+            remote.mark_no_record(cpm_id, status, message)
+        else:
+            self.store.mark_no_record(cpm_id, status, message)
 
     def _headers(self, config: dict[str, str], referer: str = "") -> dict[str, str]:
         headers = {
@@ -715,6 +1044,12 @@ class Downloader:
         return page
 
     def _download_photo(self, parsed: ParsedContainer, photo: ParsedPhoto, config: dict[str, str], detail_url: str) -> Path:
+        remote = self._remote_storage(config)
+        if remote:
+            data, content_type = self._fetch_bytes(photo.source_url, config, referer=detail_url)
+            result = remote.upload_photo(parsed, photo, data, content_type)
+            return Path(str(result.get("relative_path") or photo.label))
+
         output_dir = resolve_photo_dir(config.get("output_dir"))
         year, month = detect_year_month(parsed.begin_date, parsed.end_date)
         container = sanitize_path_part(parsed.container_no, f"CPM_{parsed.cpm_id}")
@@ -731,9 +1066,12 @@ class Downloader:
             data = target.read_bytes()
         else:
             data, _content_type = self._fetch_bytes(photo.source_url, config, referer=detail_url)
-            target.write_bytes(data)
+            temporary = target.with_suffix(target.suffix + f".{uuid.uuid4().hex}.part")
+            temporary.write_bytes(data)
+            temporary.replace(target)
         digest = hashlib.sha256(data).hexdigest()
-        self.store.upsert_photo(photo, parsed.cpm_id, target, len(data), digest)
+        relative_path = target.relative_to(output_dir).as_posix()
+        self.store.upsert_photo(photo, parsed.cpm_id, target, len(data), digest, relative_path)
         return target
 
     def _run_job(self, job_id: int, start_id: int, end_id: int, overwrite: bool = False) -> None:
@@ -743,8 +1081,12 @@ class Downloader:
             initial_config = self.store.get_config()
             if overwrite:
                 self.store.update_job(job_id, message="正在删除重复 ID 的旧照片")
-                output_dir = resolve_photo_dir(initial_config.get("output_dir"))
-                removed = self.store.purge_range(start_id, end_id, output_dir)
+                remote = self._remote_storage(initial_config)
+                if remote:
+                    removed = remote.purge_range(start_id, end_id)
+                else:
+                    output_dir = resolve_photo_dir(initial_config.get("output_dir"))
+                    removed = self.store.purge_range(start_id, end_id, output_dir)
                 self.store.update_job(job_id, message=f"已删除旧照片目录 {removed} 个")
             use_browser = (initial_config.get("page_fetch_mode") or "browser").strip().lower() == "browser"
             if use_browser:
@@ -768,11 +1110,11 @@ class Downloader:
                     parsed = parse_detail_page(cpm_id, page, base_url)
                     if parsed is None or not parsed.container_no:
                         counters["empty"] += 1
-                        self.store.mark_no_record(cpm_id, "no_record", "没有记录或页面为空")
+                        self._mark_no_record(cpm_id, "no_record", "没有记录或页面为空", config)
                     elif not parsed.photos:
                         counters["found"] += 1
                         counters["empty"] += 1
-                        self.store.upsert_container(parsed, "empty", "有箱号但没有照片")
+                        self._upsert_container(parsed, "empty", "有箱号但没有照片", config)
                     else:
                         counters["found"] += 1
                         downloaded = 0
@@ -780,10 +1122,13 @@ class Downloader:
                             self._download_photo(parsed, photo, config, detail_url)
                             downloaded += 1
                         counters["photos"] += downloaded
-                        self.store.upsert_container(parsed, "downloaded", f"下载照片 {downloaded} 张")
+                        self._upsert_container(parsed, "downloaded", f"下载照片 {downloaded} 张", config)
                 except (urllib.error.URLError, TimeoutError, RuntimeError, OSError) as exc:
                     counters["failed"] += 1
-                    self.store.mark_no_record(cpm_id, "failed", str(exc)[:500])
+                    try:
+                        self._mark_no_record(cpm_id, "failed", str(exc)[:500], config)
+                    except Exception as record_exc:
+                        self.store.update_job(job_id, message=f"{exc}; 远程错误记录失败: {record_exc}"[:500])
 
                 counters["processed"] += 1
                 self.store.update_job(
@@ -863,12 +1208,29 @@ def create_app(db_path: Path) -> Flask:
     def is_logged_in() -> bool:
         return bool(session.get("user"))
 
+    def is_admin() -> bool:
+        users = ensure_users()
+        return (users.get(current_user_name()) or {}).get("role") == "admin"
+
     def wants_json() -> bool:
-        return request.path.startswith("/api/") or request.path.startswith("/labeler/api/")
+        return (
+            request.path.startswith("/api/")
+            or request.path.startswith("/labeler/api/")
+            or request.path.startswith("/storage-api/")
+        )
+
+    def storage_api_key() -> str:
+        return str(request.headers.get("X-DAS-API-Key") or "").strip()
+
+    def require_storage_api_key():
+        key_info = store.authenticate_api_key(storage_api_key())
+        if not key_info:
+            return None, (jsonify({"error": "API Key 无效或已停用"}), 401)
+        return key_info, None
 
     @app.before_request
     def require_login():
-        if request.path in {"/login"}:
+        if request.path in {"/login"} or request.path.startswith("/storage-api/"):
             return None
         if is_logged_in():
             return None
@@ -925,6 +1287,169 @@ def create_app(db_path: Path) -> Flask:
             write_json_file(USERS_PATH, users)
         return redirect(url_for("users_page"))
 
+    @app.get("/api-keys")
+    def api_keys_page():
+        if not is_admin():
+            return Response("forbidden", status=403)
+        return Response(render_api_keys_page(store.list_api_keys()), mimetype="text/html; charset=utf-8")
+
+    @app.post("/api-keys")
+    def create_api_key_route():
+        if not is_admin():
+            return Response("forbidden", status=403)
+        store.create_api_key(request.form.get("name", ""))
+        return redirect(url_for("api_keys_page"))
+
+    @app.post("/api-keys/<int:key_id>/toggle")
+    def toggle_api_key_route(key_id: int):
+        if not is_admin():
+            return Response("forbidden", status=403)
+        store.set_api_key_enabled(key_id, request.form.get("enabled") == "1")
+        return redirect(url_for("api_keys_page"))
+
+    @app.post("/api-keys/<int:key_id>/delete")
+    def delete_api_key_route(key_id: int):
+        if not is_admin():
+            return Response("forbidden", status=403)
+        store.delete_api_key(key_id)
+        return redirect(url_for("api_keys_page"))
+
+    @app.get("/storage-api/health")
+    def storage_api_health():
+        key_info, error = require_storage_api_key()
+        if error:
+            return error
+        config = store.get_config()
+        return jsonify({
+            "ok": True,
+            "server": request.host,
+            "key_name": key_info.get("name"),
+            "photo_root": config.get("output_dir"),
+            "database": str(store.db_path),
+        })
+
+    @app.get("/storage-api/summary")
+    def storage_api_summary():
+        _key_info, error = require_storage_api_key()
+        if error:
+            return error
+        summary = store.summary()
+        summary.pop("latest_job", None)
+        return jsonify(summary)
+
+    @app.get("/storage-api/recent")
+    def storage_api_recent():
+        _key_info, error = require_storage_api_key()
+        if error:
+            return error
+        container_limit = int(request.args.get("containers") or 40)
+        photo_limit = int(request.args.get("photos") or 12)
+        return jsonify({
+            "containers": store.recent_containers(container_limit),
+            "photos": store.recent_photos(photo_limit),
+        })
+
+    @app.get("/storage-api/existing")
+    def storage_api_existing():
+        _key_info, error = require_storage_api_key()
+        if error:
+            return error
+        start_id = int(request.args.get("start_id") or 0)
+        end_id = int(request.args.get("end_id") or start_id)
+        return jsonify({"containers": store.existing_containers_in_range(start_id, end_id)})
+
+    @app.post("/storage-api/purge")
+    def storage_api_purge():
+        _key_info, error = require_storage_api_key()
+        if error:
+            return error
+        payload = request.get_json(silent=True) or {}
+        start_id = int(payload.get("start_id") or 0)
+        end_id = int(payload.get("end_id") or start_id)
+        removed = store.purge_range(start_id, end_id, resolve_photo_dir(store.get_config().get("output_dir")))
+        return jsonify({"ok": True, "removed_dirs": removed})
+
+    @app.post("/storage-api/container")
+    def storage_api_container():
+        _key_info, error = require_storage_api_key()
+        if error:
+            return error
+        payload = request.get_json(silent=True) or {}
+        if not payload.get("cpm_id"):
+            return jsonify({"error": "缺少 cpm_id"}), 400
+        store.upsert_container_record(payload)
+        return jsonify({"ok": True})
+
+    @app.post("/storage-api/no-record")
+    def storage_api_no_record():
+        _key_info, error = require_storage_api_key()
+        if error:
+            return error
+        payload = request.get_json(silent=True) or {}
+        if not payload.get("cpm_id"):
+            return jsonify({"error": "缺少 cpm_id"}), 400
+        store.mark_no_record_data(payload)
+        return jsonify({"ok": True})
+
+    @app.post("/storage-api/photo")
+    def storage_api_photo():
+        _key_info, error = require_storage_api_key()
+        if error:
+            return error
+        payload = request.get_json(silent=True) or {}
+        try:
+            data = base64.b64decode(str(payload.get("file_base64") or ""), validate=True)
+        except Exception:
+            return jsonify({"error": "图片数据无效"}), 400
+        if not data or not payload.get("cpm_id") or not payload.get("source_url"):
+            return jsonify({"error": "缺少图片或照片元数据"}), 400
+        expected_size = int(payload.get("file_size") or 0)
+        expected_digest = str(payload.get("sha256") or "")
+        digest = hashlib.sha256(data).hexdigest()
+        if expected_size and expected_size != len(data):
+            return jsonify({"error": "图片大小校验失败"}), 400
+        if expected_digest and expected_digest != digest:
+            return jsonify({"error": "图片 SHA-256 校验失败"}), 400
+
+        output_dir = resolve_photo_dir(store.get_config().get("output_dir"))
+        year, month = detect_year_month(str(payload.get("begin_date") or ""), str(payload.get("end_date") or ""))
+        container = sanitize_path_part(str(payload.get("container_no") or ""), f"CPM_{int(payload['cpm_id'])}")
+        step_dir = sanitize_path_part(str(payload.get("step_no") or "0"), "0")
+        source_path = Path(urllib.parse.unquote(urllib.parse.urlparse(str(payload.get("source_url"))).path))
+        suffix = source_path.suffix.lower()
+        if suffix not in {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}:
+            suffix = mimetypes.guess_extension(str(payload.get("content_type") or "").split(";", 1)[0]) or ".jpg"
+        filename = sanitize_path_part(
+            str(payload.get("photo_label") or ""),
+            f"{str(payload.get('step_code') or 'PHOTO')}_{int(time.time() * 1000)}",
+        ) + suffix
+        target_dir = output_dir / year / month / container / step_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / filename
+        temporary = target.with_suffix(target.suffix + f".{uuid.uuid4().hex}.part")
+        temporary.write_bytes(data)
+        temporary.replace(target)
+        relative_path = target.relative_to(output_dir).as_posix()
+        photo_id = store.upsert_photo_record({
+            **payload,
+            "local_path": str(target),
+            "relative_path": relative_path,
+            "file_size": len(data),
+            "sha256": digest,
+            "downloaded_at": payload.get("downloaded_at") or now_text(),
+        })
+        return jsonify({"ok": True, "photo_id": photo_id, "relative_path": relative_path})
+
+    @app.get("/storage-api/photo/<int:photo_id>")
+    def storage_api_photo_file(photo_id: int):
+        _key_info, error = require_storage_api_key()
+        if error:
+            return error
+        path = store.photo_path(photo_id)
+        if not path or not path.exists() or not path.is_file():
+            return jsonify({"error": "照片不存在"}), 404
+        return send_file(path, mimetype=mimetypes.guess_type(path.name)[0] or "image/jpeg")
+
     @app.get("/labeler/api/session")
     def labeler_session():
         return jsonify({"user": current_user_name()})
@@ -936,10 +1461,12 @@ def create_app(db_path: Path) -> Flask:
     @app.get("/download")
     def download_index():
         config = store.get_config()
-        summary = store.summary()
-        containers = store.recent_containers(40)
-        photos = store.recent_photos(12)
-        return Response(render_page(config, summary, containers, photos), mimetype="text/html; charset=utf-8")
+        config["database_path"] = str(store.db_path)
+        summary, containers, photos, storage_error = downloader.storage_summary()
+        return Response(
+            render_page(config, summary, containers, photos, storage_error),
+            mimetype="text/html; charset=utf-8",
+        )
 
     def sync_labeler_photo_root() -> dict:
         labeler_config = labeler_server.get_config()
@@ -1041,6 +1568,9 @@ def create_app(db_path: Path) -> Flask:
 
     @app.post("/config")
     def save_config():
+        database_path = request.form.get("database_path", "").strip()
+        if database_path:
+            save_runtime_config({"database_path": database_path})
         store.save_config(
             {
                 "base_url": request.form.get("base_url", ""),
@@ -1053,11 +1583,27 @@ def create_app(db_path: Path) -> Flask:
                 "login_otp": request.form.get("login_otp", ""),
                 "otp_enabled": "1" if request.form.get("otp_enabled") else "0",
                 "page_fetch_mode": "browser",
+                "storage_mode": request.form.get("storage_mode", "local"),
+                "storage_api_url": request.form.get("storage_api_url", ""),
+                "storage_api_key": request.form.get("storage_api_key", ""),
                 "delay_seconds": request.form.get("delay_seconds", ""),
                 "timeout_seconds": request.form.get("timeout_seconds", ""),
             }
         )
         return redirect(url_for("download_index"))
+
+    @app.post("/api/storage-test")
+    def storage_test():
+        payload = request.get_json(silent=True) or {}
+        try:
+            client = RemoteStorageClient(
+                payload.get("storage_api_url") or "",
+                payload.get("storage_api_key") or "",
+                float(payload.get("timeout_seconds") or 10),
+            )
+            return jsonify(client.health())
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
 
     @app.post("/jobs")
     def start_job():
@@ -1068,7 +1614,11 @@ def create_app(db_path: Path) -> Flask:
             return redirect(url_for("download_index"))
         end_id = start_id + max(1, count) - 1
         overwrite = request.form.get("confirm_overwrite") == "1"
-        existing = store.existing_containers_in_range(start_id, end_id)
+        try:
+            existing = downloader.existing_containers_in_range(start_id, end_id)
+        except Exception as exc:
+            store.mark_no_record(start_id, "start_failed", str(exc)[:500])
+            return redirect(url_for("download_index"))
         if existing and not overwrite:
             return Response(
                 render_confirm_overwrite_page(start_id, count, end_id, existing),
@@ -1088,10 +1638,20 @@ def create_app(db_path: Path) -> Flask:
 
     @app.get("/api/status")
     def api_status():
-        return jsonify(store.summary())
+        summary, _containers, _photos, storage_error = downloader.storage_summary()
+        if storage_error:
+            summary["storage_error"] = storage_error
+        return jsonify(summary)
 
     @app.get("/photo/<int:photo_id>")
     def photo_file(photo_id: int):
+        config = store.get_config()
+        if (config.get("storage_mode") or "local").lower() == "remote":
+            try:
+                data, content_type = RemoteStorageClient.from_config(config).photo_bytes(photo_id)
+                return Response(data, mimetype=content_type)
+            except Exception:
+                return Response("not found", status=404)
         path = store.photo_path(photo_id)
         if not path or not path.exists():
             return Response("not found", status=404)
@@ -1190,7 +1750,85 @@ th {{ background:#edf1f3; color:#44515a; }}
 </html>"""
 
 
-def render_page(config: dict, summary: dict, containers: list[dict], photos: list[dict]) -> str:
+def render_api_keys_page(api_keys: list[dict]) -> str:
+    rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(str(row.get('name') or ''))}</td>"
+        "<td><div class=\"key-row\"><div class=\"secret-field\">"
+        f"<input id=\"api-key-{int(row['id'])}\" type=\"password\" readonly value=\"{html.escape(str(row.get('api_key') or ''))}\">"
+        f"<button class=\"eye-button\" type=\"button\" title=\"显示或隐藏\" aria-label=\"显示或隐藏 API Key\" onclick=\"toggleKey('api-key-{int(row['id'])}')\">&#128065;</button>"
+        "</div>"
+        f"<button type=\"button\" onclick=\"copyKey('api-key-{int(row['id'])}')\">复制</button>"
+        "</div></td>"
+        f"<td>{'启用' if row.get('enabled') else '停用'}</td>"
+        f"<td>{html.escape(str(row.get('created_at') or ''))}</td>"
+        f"<td>{html.escape(str(row.get('last_used_at') or '从未'))}</td>"
+        "<td><div class=\"row-actions\">"
+        f"<form method=\"post\" action=\"/api-keys/{int(row['id'])}/toggle\"><input type=\"hidden\" name=\"enabled\" value=\"{'0' if row.get('enabled') else '1'}\"><button type=\"submit\">{'停用' if row.get('enabled') else '启用'}</button></form>"
+        f"<form method=\"post\" action=\"/api-keys/{int(row['id'])}/delete\" onsubmit=\"return confirm('确认删除这个 API Key？')\"><button class=\"danger\" type=\"submit\">删除</button></form>"
+        "</div></td>"
+        "</tr>"
+        for row in api_keys
+    )
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>存储 API Key</title>
+<style>
+body {{ margin:0; font-family:Arial,"Microsoft YaHei",sans-serif; background:#f4f6f8; color:#18242c; }}
+main {{ max-width:1180px; margin:0 auto; padding:24px; }}
+.panel {{ background:white; border:1px solid #d8e0e5; border-radius:6px; padding:16px; margin-bottom:14px; }}
+h1 {{ margin:0 0 16px; font-size:22px; }}
+.create-row {{ display:grid; grid-template-columns:1fr auto; gap:10px; align-items:end; }}
+label {{ display:block; margin-bottom:6px; color:#51606b; font-size:13px; }}
+input {{ box-sizing:border-box; width:100%; padding:9px; border:1px solid #bcc7ce; border-radius:4px; }}
+button,a.button {{ border:0; border-radius:4px; background:#1f6f78; color:white; padding:9px 14px; cursor:pointer; font-weight:700; text-decoration:none; }}
+.danger {{ background:#a84444; }}
+table {{ width:100%; border-collapse:collapse; font-size:13px; }}
+th,td {{ border-bottom:1px solid #e1e5e8; padding:8px; text-align:left; }}
+th {{ background:#edf1f3; color:#44515a; }}
+.key-row {{ display:grid; grid-template-columns:minmax(260px,1fr) auto; gap:6px; }}
+.secret-field {{ position:relative; min-width:0; }}
+.secret-field input {{ padding-right:42px; }}
+.eye-button {{ position:absolute; right:3px; top:50%; transform:translateY(-50%); width:34px; height:30px; padding:0; background:transparent; color:#51606b; font-size:18px; }}
+.eye-button:hover {{ background:#e8eef1; }}
+.row-actions {{ display:flex; gap:6px; }}
+.row-actions form {{ margin:0; }}
+.hint {{ color:#6b7780; font-size:13px; }}
+</style>
+<script>
+function toggleKey(id) {{ const input=document.getElementById(id); input.type=input.type==='password'?'text':'password'; }}
+function copyKey(id) {{
+  const input=document.getElementById(id);
+  if (navigator.clipboard && window.isSecureContext) {{ navigator.clipboard.writeText(input.value); return; }}
+  const oldType=input.type; input.type='text'; input.select(); document.execCommand('copy'); input.type=oldType;
+}}
+</script>
+</head>
+<body><main>
+<p><a class="button" href="/download">返回下载页</a></p>
+<section class="panel">
+  <h1>存储 API Key</h1>
+  <p class="hint">每台下载电脑可以使用独立 Key。Key 用于连接本机的存储 API，可随时查看、复制、停用或删除。</p>
+  <form method="post" action="/api-keys">
+    <div class="create-row"><div><label>设备名称</label><input name="name" required placeholder="例如：P3 Windows VM"></div><button type="submit">生成 API Key</button></div>
+  </form>
+</section>
+<section class="panel">
+  <table><tr><th>设备</th><th>API Key</th><th>状态</th><th>创建时间</th><th>最后使用</th><th>操作</th></tr>{rows}</table>
+</section>
+</main></body></html>"""
+
+
+def render_page(
+    config: dict,
+    summary: dict,
+    containers: list[dict],
+    photos: list[dict],
+    storage_error: str = "",
+) -> str:
     job = summary.get("latest_job") or {}
     job_total = max(1, int(job.get("total") or 1))
     job_processed = int(job.get("processed") or 0)
@@ -1206,6 +1844,13 @@ def render_page(config: dict, summary: dict, containers: list[dict], photos: lis
     login_status = html.escape(config.get("login_status") or "未登录")
     login_checked_at = html.escape(config.get("login_checked_at") or "")
     otp_checked = "checked" if str(config.get("otp_enabled") or "0").lower() in {"1", "true", "yes", "on"} else ""
+    storage_mode = str(config.get("storage_mode") or "local").lower()
+    storage_api_url = html.escape(config.get("storage_api_url") or "")
+    storage_api_key = html.escape(config.get("storage_api_key") or "")
+    database_path = html.escape(config.get("database_path") or str(DEFAULT_DATA_DIR / "das_cpm_photos.sqlite3"))
+    storage_error_html = (
+        f'<section class="panel error">远程存储连接失败：{html.escape(storage_error)}</section>' if storage_error else ""
+    )
     user = html.escape(current_user_name())
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -1254,6 +1899,13 @@ th {{ background:#edf1f3; color:#44515a; }}
 .photo {{ background:white; border:1px solid #d9dee3; border-radius:6px; padding:6px; }}
 .photo img {{ width:100%; height:110px; object-fit:cover; display:block; border-radius:4px; }}
 .muted {{ color:#6b7780; }}
+.error {{ color:#9b2c2c; border-color:#e1aaaa; background:#fff7f7; }}
+.secret-row {{ display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:8px; align-items:center; }}
+.secret-field {{ position:relative; min-width:0; }}
+.secret-field input {{ padding-right:42px; }}
+.eye-button {{ position:absolute; right:3px; top:50%; transform:translateY(-50%); width:34px; height:30px; padding:0; background:transparent; color:#51606b; font-size:18px; }}
+.eye-button:hover {{ background:#e8eef1; }}
+.secret-row button {{ white-space:nowrap; }}
 @media (max-width: 980px) {{ .grid, .row, .stats {{ grid-template-columns: 1fr; }} main {{ padding:14px; }} }}
 </style>
 <script>
@@ -1273,6 +1925,32 @@ function openSettings() {{
 }}
 function closeSettings() {{
   document.getElementById('settings-modal').classList.remove('open');
+}}
+function toggleSecret(id) {{
+  const input = document.getElementById(id);
+  input.type = input.type === 'password' ? 'text' : 'password';
+}}
+function copySecret(id) {{
+  const input = document.getElementById(id);
+  if (navigator.clipboard && window.isSecureContext) {{ navigator.clipboard.writeText(input.value); return; }}
+  const oldType = input.type; input.type = 'text'; input.select(); document.execCommand('copy'); input.type = oldType;
+}}
+function testStorage() {{
+  const result = document.getElementById('storage-test-result');
+  result.textContent = '正在测试...';
+  fetch('/api/storage-test', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{
+      storage_api_url: document.getElementById('storage_api_url').value,
+      storage_api_key: document.getElementById('storage_api_key').value,
+      timeout_seconds: document.querySelector('[name=timeout_seconds]').value
+    }})
+  }}).then(async r => {{
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || '连接失败');
+    result.textContent = '连接成功：' + (data.key_name || '') + '，照片目录：' + (data.photo_root || '');
+  }}).catch(err => {{ result.textContent = '连接失败：' + err.message; }});
 }}
 window.addEventListener('DOMContentLoaded', recalcEndId);
 setInterval(() => {{
@@ -1306,6 +1984,7 @@ setInterval(() => {{
   </div>
 </header>
 <main>
+  {storage_error_html}
   <section class="stats">
     <div class="stat">下次开始 ID <b>{next_start_id}</b></div>
     <div class="stat">上次完成 ID <b id="max-done">{summary.get("max_completed_id") or ""}</b></div>
@@ -1341,7 +2020,36 @@ setInterval(() => {{
       <div class="modal-body">
         <form method="post" action="/config">
           <label>DAS 地址</label><input name="base_url" value="{html.escape(config.get("base_url") or DEFAULT_BASE_URL)}">
-          <label>照片保存目录</label><input name="output_dir" value="{html.escape(config.get("output_dir") or str(DEFAULT_PHOTO_DIR))}">
+          <div class="row">
+            <div>
+              <label>存储模式</label>
+              <select name="storage_mode">
+                <option value="local" {"selected" if storage_mode == "local" else ""}>本地一体模式</option>
+                <option value="remote" {"selected" if storage_mode == "remote" else ""}>远程 API 模式</option>
+              </select>
+            </div>
+            <div><label>本机照片目录（作为存储服务器时使用）</label><input name="output_dir" value="{html.escape(config.get("output_dir") or str(DEFAULT_PHOTO_DIR))}"></div>
+            <div><label>本机数据库路径（修改后需重启）</label><input name="database_path" value="{database_path}"></div>
+          </div>
+          <div class="row two">
+            <div><label>远程存储 API 地址</label><input id="storage_api_url" name="storage_api_url" placeholder="http://P3-IP:8787" value="{storage_api_url}"></div>
+            <div>
+              <label>远程存储 API Key</label>
+              <div class="secret-row">
+                <div class="secret-field">
+                  <input id="storage_api_key" name="storage_api_key" type="password" value="{storage_api_key}">
+                  <button class="eye-button" type="button" title="显示或隐藏" aria-label="显示或隐藏 API Key" onclick="toggleSecret('storage_api_key')">&#128065;</button>
+                </div>
+                <button class="plain-button" type="button" onclick="copySecret('storage_api_key')">复制</button>
+                <button class="plain-button" type="button" onclick="location.href='/api-keys'">API Key 管理</button>
+              </div>
+            </div>
+          </div>
+          <div class="actions" style="margin-bottom:12px">
+            <button class="plain-button" type="button" onclick="testStorage()">测试远程连接</button>
+            <span id="storage-test-result" class="hint"></span>
+          </div>
+          <div class="hint" style="margin-bottom:12px">远程模式下，照片和箱号数据写入目标服务器；本机数据库仅保留下载设置与任务进度。</div>
           <div class="row">
             <div>
               <label>浏览器</label>
@@ -1478,7 +2186,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="DAS CPM photo downloader web tool.")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8787)
-    parser.add_argument("--db", default=str(DEFAULT_DATA_DIR / "das_cpm_photos.sqlite3"))
+    parser.add_argument("--db", default="", help="SQLite database path. Overrides DAS_PHOTO_DB and runtime settings.")
     parser.add_argument("--parse-html", default="", help="Parse a saved DAS detail HTML file and print a summary.")
     parser.add_argument("--parse-cpm-id", type=int, default=2000)
     args = parser.parse_args(argv)
@@ -1500,9 +2208,16 @@ def main(argv: list[str] | None = None) -> int:
         print("steps=" + ", ".join(f"{step}:{count}" for step, count in sorted(by_step.items())))
         return 0
 
-    app = create_app(Path(args.db))
+    runtime_config = get_runtime_config()
+    database_path = (
+        args.db
+        or os.environ.get("DAS_PHOTO_DB", "").strip()
+        or runtime_config.get("database_path", "").strip()
+        or str(DEFAULT_DATA_DIR / "das_cpm_photos.sqlite3")
+    )
+    app = create_app(Path(database_path).expanduser())
     print(f"DAS 集装箱照片下载工具: http://{args.host}:{args.port}")
-    print(f"数据库: {args.db}")
+    print(f"数据库: {database_path}")
     app.run(host=args.host, port=args.port, threaded=True)
     return 0
 

@@ -64,6 +64,9 @@ python -m pip install -r requirements.txt
 - 训练任务和标签配置：`labeler\data\label_config.json`
 - 照片目录默认值：项目目录上一级的 `photos`
 
+数据库路径也可以在下载页面的“设置”中修改。数据库路径修改后需要重启服务；该启动配置保存在
+`data/runtime_config.json`。也可以用 `DAS_PHOTO_DB` 环境变量或 `--db` 命令行参数覆盖。
+
 照片目录可以在页面设置里修改。下载器保存目录会同步给标注器的照片根目录。
 
 如果要强制指定照片根目录，可以设置环境变量：
@@ -77,6 +80,33 @@ Windows 示例：
 ```bat
 set DAS_PHOTO_ROOT=D:\RPA\photos
 ```
+
+## 本地与远程 API 存储
+
+每套 DAS Photo 都可以作为本地一体实例，也可以作为其他下载电脑的存储服务器。
+
+### 存储服务器（例如 P3）
+
+1. 在下载页面“设置”中选择“本地一体模式”。
+2. 设置 P3 本机的照片目录和数据库路径。
+3. 打开“API Key”页面，为每台下载电脑生成一个 Key。
+4. 使用 `run_server.sh` 启动服务，并确保下载电脑可以访问 `8787` 端口。
+
+存储服务器收到上传后，会先校验文件大小和 SHA-256，再把图片写入临时文件并原子改名，最后更新本机 SQLite。
+
+### 远程下载客户端（例如 Windows VM）
+
+1. 在下载页面“设置”中选择“远程 API 模式”。
+2. 填写存储服务器地址，例如 `http://P3-IP:8787`。
+3. 填写 P3 生成的 API Key，点击“测试远程连接”。
+4. 保存设置后正常启动下载。
+
+远程模式下，下载电脑只负责登录 DAS 和取得图片。图片与箱号元数据通过 API 上传，最终照片目录和业务数据库都由
+存储服务器决定，因此不需要共享 SQLite，也不需要在 Windows 和 Linux 之间转换路径。
+下载电脑仍保留一个本机 SQLite，用于保存自己的设置、下载任务进度和失败信息；照片与正式箱号数据以存储服务器为准。
+
+API Key 在服务器管理页面中可以随时查看、复制、停用或删除。Key 以避免内网误操作为主要目的；如果服务开放到不可信
+网络，应在前面增加 HTTPS 和更严格的访问控制。
 
 ## 标注 JSON
 
@@ -117,6 +147,7 @@ ExecStart=/data/rpa/container_photo_tool/run_server.sh
 Restart=always
 RestartSec=5
 Environment=DAS_PHOTO_ROOT=/data/rpa/photos
+Environment=DAS_PHOTO_DB=/data/rpa/das_photo/data/das_cpm_photos.sqlite3
 Environment=DAS_PHOTO_HOST=0.0.0.0
 Environment=DAS_PHOTO_PORT=8787
 
